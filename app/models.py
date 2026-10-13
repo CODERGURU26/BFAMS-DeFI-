@@ -2,7 +2,9 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import CHAR, DateTime, ForeignKey, Numeric, Text, Uuid, func, text
+from sqlalchemy import (
+    CHAR, DateTime, ForeignKey, Numeric, Text, UniqueConstraint, Uuid, func, text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -20,6 +22,7 @@ class User(Base):
         DateTime(timezone=True), server_default=func.now()
     )
 
+   
 
 class DataProvider(Base):
     __tablename__ = "data_providers"
@@ -95,6 +98,15 @@ class FinancialAccount(Base):
 
 class Transaction(Base):
     __tablename__ = "transactions"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "external_transaction_id",
+            name="transactions_account_external_id_key",
+        ),
+    )
+
 
     id: Mapped[uuid.UUID] = mapped_column(
         Uuid, primary_key=True, server_default=text("gen_random_uuid()")
