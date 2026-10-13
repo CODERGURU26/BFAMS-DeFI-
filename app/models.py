@@ -3,7 +3,16 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
-    CHAR, DateTime, ForeignKey, Numeric, Text, UniqueConstraint, Uuid, func, text,
+    CHAR,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Numeric,
+    Text,
+    UniqueConstraint,
+    Uuid,
+    func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -22,7 +31,6 @@ class User(Base):
         DateTime(timezone=True), server_default=func.now()
     )
 
-   
 
 class DataProvider(Base):
     __tablename__ = "data_providers"
@@ -38,6 +46,7 @@ class DataProvider(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
 
 class FinancialInstitution(Base):
     __tablename__ = "financial_institutions"
@@ -70,6 +79,7 @@ class FinancialConnection(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
 
 class FinancialAccount(Base):
     __tablename__ = "financial_accounts"
@@ -107,7 +117,6 @@ class Transaction(Base):
         ),
     )
 
-
     id: Mapped[uuid.UUID] = mapped_column(
         Uuid, primary_key=True, server_default=text("gen_random_uuid()")
     )
@@ -129,3 +138,24 @@ class Transaction(Base):
         DateTime(timezone=True), server_default=func.now()
     )
 
+
+class DataSyncRun(Base):
+    __tablename__ = "data_sync_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    connection_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("financial_connections.id")
+    )
+    sync_type: Mapped[str] = mapped_column(Text, server_default=text("'full'"))
+    status: Mapped[str] = mapped_column(Text, server_default=text("'pending'"))
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    records_processed: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
