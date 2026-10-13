@@ -1,9 +1,10 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
     CHAR,
+    Date,
     DateTime,
     ForeignKey,
     Integer,
@@ -155,6 +156,62 @@ class DataSyncRun(Base):
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     records_processed: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class MfScheme(Base):
+    __tablename__ = "mf_schemes"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    scheme_code: Mapped[str] = mapped_column(Text, unique=True)
+    isin_primary: Mapped[str | None] = mapped_column(Text)
+    isin_reinvestment: Mapped[str | None] = mapped_column(Text)
+    scheme_name: Mapped[str] = mapped_column(Text)
+    plan: Mapped[str | None] = mapped_column(Text)
+    option_name: Mapped[str | None] = mapped_column(Text)
+    amc_name: Mapped[str] = mapped_column(Text)
+    scheme_type: Mapped[str] = mapped_column(Text)
+    scheme_category: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class MfNav(Base):
+    __tablename__ = "mf_navs"
+
+    scheme_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("mf_schemes.id"), primary_key=True
+    )
+    nav_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    nav: Mapped[Decimal] = mapped_column(Numeric(20, 6))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class MarketDataLoad(Base):
+    __tablename__ = "market_data_loads"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    source: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, server_default=text("'running'"))
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rows_loaded: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    rows_rejected: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
