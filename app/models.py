@@ -3,10 +3,12 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    BigInteger,
     CHAR,
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     Text,
@@ -213,6 +215,82 @@ class MarketDataLoad(Base):
     rows_loaded: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     rows_rejected: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class InvestmentHolding(Base):
+    __tablename__ = "investment_holdings"
+
+    __table_args__ = (
+        Index(
+            "idx_investment_holdings_account_observed",
+            "account_id",
+            "observed_at",
+        ),
+        Index(
+            "idx_investment_holdings_mf_scheme",
+            "mf_scheme_id",
+            postgresql_where=text("mf_scheme_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("financial_accounts.id")
+    )
+    mf_scheme_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("mf_schemes.id"), nullable=True
+    )
+    asset_name: Mapped[str] = mapped_column(Text)
+    asset_identifier: Mapped[str | None] = mapped_column(Text)
+    asset_type: Mapped[str] = mapped_column(Text)
+    quantity: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
+    unit_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 4))
+    market_value: Mapped[Decimal | None] = mapped_column(Numeric(20, 4))
+    currency: Mapped[str] = mapped_column(CHAR(3), server_default=text("'INR'"))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    source_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class SecurityDailyPrice(Base):
+    __tablename__ = "security_daily_prices"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol",
+            "trading_date",
+            "instrument_type",
+            name="uq_security_daily_prices_symbol_date_type",
+        ),
+        Index("idx_security_daily_prices_sym_date", "symbol", "trading_date"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    symbol: Mapped[str] = mapped_column(Text)
+    series: Mapped[str | None] = mapped_column(Text, nullable=True)
+    instrument_type: Mapped[str] = mapped_column(Text)  # 'equity' or 'index'
+    exchange: Mapped[str] = mapped_column(Text, server_default=text("'NSE'"))
+    trading_date: Mapped[date] = mapped_column(Date)
+    open_price: Mapped[Decimal] = mapped_column(Numeric(16, 4))
+    high_price: Mapped[Decimal] = mapped_column(Numeric(16, 4))
+    low_price: Mapped[Decimal] = mapped_column(Numeric(16, 4))
+    close_price: Mapped[Decimal] = mapped_column(Numeric(16, 4))
+    last_price: Mapped[Decimal | None] = mapped_column(Numeric(16, 4))
+    prev_close: Mapped[Decimal | None] = mapped_column(Numeric(16, 4))
+    volume: Mapped[int | None] = mapped_column(BigInteger)
+    turnover_lacs: Mapped[Decimal | None] = mapped_column(Numeric(16, 4))
+    source: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
