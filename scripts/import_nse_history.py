@@ -32,14 +32,14 @@ def parse_args():
     parser.add_argument(
         "--start-date",
         type=str,
-        default="2024-10-01",
-        help="Start date in YYYY-MM-DD format (default: 2024-10-01)",
+        default="2021-10-14",
+        help="Start date in YYYY-MM-DD format (default: 2021-10-14)",
     )
     parser.add_argument(
         "--end-date",
         type=str,
-        default="2024-10-15",
-        help="End date in YYYY-MM-DD format (default: 2024-10-15)",
+        default="2026-10-13",
+        help="End date in YYYY-MM-DD format (default: 2026-10-13)",
     )
     parser.add_argument(
         "--max-days",
@@ -50,8 +50,8 @@ def parse_args():
     parser.add_argument(
         "--pause",
         type=float,
-        default=0.25,
-        help="Pause in seconds between downloads for polite rate limiting (default: 0.25)",
+        default=0.05,
+        help="Pause in seconds between downloads for polite rate limiting (default: 0.05)",
     )
     parser.add_argument(
         "--series",

@@ -162,9 +162,11 @@ def fetch_nse_url_with_retries(
     max_retries: int = 3,
     initial_backoff: float = 1.0,
     timeout: float = 15.0,
+    client: Optional[Any] = None,
 ) -> Tuple[int, bytes]:
     """
     Fetches URL with exponential backoff on transient errors.
+    Uses httpx.Client if provided for persistent connection pooling.
     Returns (status_code, content_bytes).
     Returns (404, b'') if file not found (non-trading day).
     """
@@ -172,13 +174,20 @@ def fetch_nse_url_with_retries(
         "User-Agent": HTTP_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
-    req = urllib.request.Request(url, headers=headers)
 
     backoff = initial_backoff
     for attempt in range(1, max_retries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.status, resp.read()
+            if client is not None:
+                resp = client.get(url, timeout=timeout)
+                if resp.status_code == 404:
+                    return 404, b""
+                resp.raise_for_status()
+                return resp.status_code, resp.content
+            else:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.status, resp.read()
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return 404, b""
@@ -186,7 +195,11 @@ def fetch_nse_url_with_retries(
                 raise
             time.sleep(backoff)
             backoff *= 2
-        except (urllib.error.URLError, TimeoutError, ConnectionResetError) as e:
+        except Exception as e:
+            # Handle httpx.HTTPStatusError (404) or transient network exceptions
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code == 404:
+                return 404, b""
             if attempt == max_retries:
                 raise
             time.sleep(backoff)
@@ -460,6 +473,25 @@ class NSEHistoricalImporter:
         self.raw_index_dir.mkdir(parents=True, exist_ok=True)
         self.manifest: Dict[str, Any] = self._load_manifest()
 
+        try:
+            import httpx
+            self._client = httpx.Client(headers={"User-Agent": HTTP_USER_AGENT}, timeout=15.0)
+        except Exception:
+            self._client = None
+
+    def close(self):
+        if hasattr(self, "_client") and self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
     def _load_manifest(self) -> Dict[str, Any]:
         if self.manifest_path.exists():
             try:
@@ -474,7 +506,12 @@ class NSEHistoricalImporter:
         temp_path = self.manifest_path.with_suffix(".tmp")
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(self.manifest, f, indent=2, default=str)
-        temp_path.replace(self.manifest_path)
+        for _ in range(5):
+            try:
+                temp_path.replace(self.manifest_path)
+                break
+            except PermissionError:
+                time.sleep(0.05)
 
     def is_date_processed(self, target_date: date) -> bool:
         dt_str = target_date.isoformat()
@@ -526,7 +563,7 @@ class NSEHistoricalImporter:
                 equity_bytes = f.read()
         else:
             url = EQUITY_BHAVCOPY_URL_TEMPLATE.format(ddmmyyyy=ddmmyyyy)
-            status, equity_bytes = fetch_nse_url_with_retries(url)
+            status, equity_bytes = fetch_nse_url_with_retries(url, client=self._client)
             if status == 404:
                 # Expected non-trading day (weekend or exchange holiday)
                 self.manifest[dt_str] = {
@@ -548,7 +585,7 @@ class NSEHistoricalImporter:
                 index_bytes = f.read()
         else:
             url = INDEX_DAILY_URL_TEMPLATE.format(ddmmyyyy=ddmmyyyy)
-            status, index_bytes = fetch_nse_url_with_retries(url)
+            status, index_bytes = fetch_nse_url_with_retries(url, client=self._client)
             if status == 200:
                 with open(idx_file_path, "wb") as f:
                     f.write(index_bytes)
@@ -610,7 +647,7 @@ class NSEHistoricalImporter:
         start_date: date,
         end_date: date,
         max_trading_days: Optional[int] = None,
-        pause_seconds: float = 0.2,
+        pause_seconds: float = 0.1,
     ) -> Dict[str, Any]:
         """
         Processes a bounded batch of dates between start_date and end_date.
@@ -654,6 +691,11 @@ class NSEHistoricalImporter:
                     if first_imported_date is None:
                         first_imported_date = curr
                     last_imported_date = curr
+                    if trading_days_imported % 10 == 0:
+                        logger.info(
+                            f"[{curr}] Progress: {trading_days_imported} trading days imported "
+                            f"(+{total_equity_rows} equities, +{total_index_rows} indices)"
+                        )
 
                 # Politeness pause for new external downloads
                 if action not in ("SKIPPED_EXISTING",):
@@ -662,6 +704,12 @@ class NSEHistoricalImporter:
             except Exception as e:
                 logger.error(f"Failed to process {curr}: {e}")
                 failed_dates.append({"date": curr.isoformat(), "error": str(e)})
+
+            if total_days_inspected % 50 == 0:
+                logger.info(
+                    f"Date scan: {curr} | Inspected: {total_days_inspected} | "
+                    f"Imported: {trading_days_imported} | Skipped: {skipped_existing} | Non-trading: {non_trading_days}"
+                )
 
             curr += timedelta(days=1)
 
