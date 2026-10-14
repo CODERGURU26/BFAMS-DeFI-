@@ -369,5 +369,99 @@ class TestDatabaseSafetyAndIsolation(unittest.TestCase):
         )
 
 
+class TestAnalyticsRegressionFixes(unittest.TestCase):
+    """5. Regression tests for Fix A, Fix B, and Fix C."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = get_test_engine()
+        cls.session = Session(cls.engine)
+        verify_test_db(cls.session)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.session.close()
+
+    def test_fix_a_rolling_returns_weekend_deduplication(self):
+        """
+        Fix A: Stepping with step_days=1 over non-trading days (weekends)
+        must NOT produce duplicate actual (start_date, end_date) observation pairs.
+        """
+        pts = [
+            NavPoint(date(2023, 1, 2), Decimal("100.00")),  # Mon
+            NavPoint(date(2023, 1, 3), Decimal("101.00")),  # Tue
+            NavPoint(date(2023, 1, 4), Decimal("102.00")),  # Wed
+            NavPoint(date(2023, 1, 5), Decimal("103.00")),  # Thu
+            NavPoint(date(2023, 1, 6), Decimal("104.00")),  # Fri
+            # Sat/Sun gap
+            NavPoint(date(2023, 1, 9), Decimal("105.00")),  # Mon
+            NavPoint(date(2023, 1, 10), Decimal("106.00")), # Tue
+            NavPoint(date(2023, 1, 11), Decimal("107.00")), # Wed
+            NavPoint(date(2023, 1, 12), Decimal("108.00")), # Thu
+            NavPoint(date(2023, 1, 13), Decimal("109.00")), # Fri
+            # Sat/Sun gap
+            NavPoint(date(2023, 1, 16), Decimal("110.00")), # Mon
+            NavPoint(date(2023, 1, 17), Decimal("111.00")), # Tue
+        ]
+
+        summary = calculate_rolling_returns(pts, window_days=7, step_days=1)
+
+        # Check deduplication: all observation windows must have unique actual start and end dates
+        observed_windows = [(o.start_date, o.end_date) for o in summary.observations]
+        self.assertEqual(len(observed_windows), len(set(observed_windows)))
+
+        # Prior to fix, Friday 2023-01-06 -> 2023-01-13 was recorded 3 times (Fri, Sat, Sun)
+        friday_pairs = [w for w in observed_windows if w == (date(2023, 1, 6), date(2023, 1, 13))]
+        self.assertEqual(len(friday_pairs), 1)
+
+        # Confirm summary statistics use deduplicated count
+        self.assertEqual(summary.total_periods, len(summary.observations))
+        pct_vals = [o.return_pct for o in summary.observations]
+        self.assertEqual(summary.min_pct, min(pct_vals))
+        self.assertEqual(summary.max_pct, max(pct_vals))
+
+    def test_fix_b_repository_rolling_returns_reversed_dates(self):
+        """
+        Fix B: get_scheme_rolling_returns must reject start_date >= end_date with InvalidDateRangeError.
+        """
+        with self.assertRaises(InvalidDateRangeError):
+            get_scheme_rolling_returns(
+                self.session,
+                "100033",
+                start_date=date(2023, 1, 1),
+                end_date=date(2022, 1, 1),
+            )
+
+        with self.assertRaises(InvalidDateRangeError):
+            get_scheme_rolling_returns(
+                self.session,
+                "100033",
+                start_date=date(2022, 1, 1),
+                end_date=date(2022, 1, 1),
+            )
+
+    def test_fix_c_comparison_drawdown_date_alignment(self):
+        """
+        Fix C: compare_schemes must pass the actual selected start date (ret.start_date_actual)
+        into get_scheme_drawdown so the drawdown series matches the returns calculation.
+        """
+        comp = compare_schemes(
+            self.session,
+            ["100033"],
+            start_date=date(2022, 1, 1),  # Saturday -> adjusted to 2021-12-31
+            end_date=date(2024, 1, 1),
+        )
+
+        res = comp["results"][0]
+        self.assertEqual(res["status"], "success")
+        self.assertEqual(res["start_date_actual"], "2021-12-31")
+        self.assertEqual(res["end_date_actual"], "2024-01-01")
+
+        # Prior to fix, total_observations was 492 (omitted 2021-12-31).
+        # With fix, total_observations is 493 (includes the actual start date 2021-12-31).
+        self.assertEqual(res["total_observations"], 493)
+        self.assertEqual(res["max_drawdown_pct"], "-28.0313")
+
+
 if __name__ == "__main__":
     unittest.main()

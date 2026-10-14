@@ -102,6 +102,11 @@ def get_scheme_nav_history(
     db: Session = Depends(get_mf_db),
 ):
     """Retrieve chronological NAV observations for a scheme."""
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"start_date ({start_date}) must be on or before end_date ({end_date})",
+        )
     try:
         scheme = get_scheme_by_code(db, scheme_code)
         pts = get_nav_history(

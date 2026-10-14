@@ -104,6 +104,32 @@ class TestMfAnalyticsRoutes(unittest.TestCase):
         self.assertEqual(data["schemes_evaluated"], 2)
         self.assertEqual(len(data["results"]), 2)
 
+    def test_route_navs_reversed_dates_rejected(self):
+        """Fix B: GET /mf/schemes/{code}/navs rejects start_date > end_date with HTTP 400."""
+        response = self.client.get("/mf/schemes/100033/navs?start_date=2023-10-14&end_date=2021-10-14")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("start_date", response.json()["detail"])
+
+    def test_route_navs_equal_dates_allowed(self):
+        """Fix B: GET /mf/schemes/{code}/navs allows start_date == end_date for single-day lookup."""
+        response = self.client.get("/mf/schemes/100033/navs?start_date=2021-10-14&end_date=2021-10-14")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["total_observations"], 1)
+        self.assertEqual(data["navs"][0]["nav_date"], "2021-10-14")
+
+    def test_route_rolling_returns_reversed_dates_rejected(self):
+        """Fix B: GET /mf/schemes/{code}/rolling-returns rejects start_date > end_date with HTTP 400."""
+        response = self.client.get("/mf/schemes/100033/rolling-returns?start_date=2024-01-01&end_date=2023-01-01")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("start_date", response.json()["detail"])
+
+    def test_route_rolling_returns_equal_dates_rejected(self):
+        """Fix B: GET /mf/schemes/{code}/rolling-returns rejects start_date == end_date with HTTP 400."""
+        response = self.client.get("/mf/schemes/100033/rolling-returns?start_date=2023-01-01&end_date=2023-01-01")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("start_date", response.json()["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

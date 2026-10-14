@@ -244,6 +244,8 @@ def get_scheme_rolling_returns(
     Compute rolling returns across the scheme's history.
     """
     verify_test_db(session)
+    if start_date and end_date and start_date >= end_date:
+        raise InvalidDateRangeError(f"start_date ({start_date}) must be before end_date ({end_date})")
     nav_series = get_nav_history(session, scheme_code, start_date=start_date, end_date=end_date)
     return calculate_rolling_returns(
         nav_series=nav_series,
@@ -277,7 +279,7 @@ def compare_schemes(
                 session, code_clean, start_date, end_date, max_staleness_days=max_staleness_days
             )
             dd = get_scheme_drawdown(
-                session, code_clean, start_date=start_date, end_date=end_date
+                session, code_clean, start_date=ret.start_date_actual, end_date=ret.end_date_actual
             )
             results.append({
                 "scheme_code": scheme.scheme_code,

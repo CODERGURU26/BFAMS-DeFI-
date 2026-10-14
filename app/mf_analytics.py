@@ -331,6 +331,8 @@ def calculate_rolling_returns(
     latest_possible_start = last_date - timedelta(days=window_days)
     annualized = window_days >= 365
 
+    seen_windows: set[tuple[date, date]] = set()
+
     while current_start <= latest_possible_start:
         target_end = current_start + timedelta(days=window_days)
 
@@ -340,8 +342,15 @@ def calculate_rolling_returns(
         if start_obs and end_obs:
             actual_start_date, start_nav = start_obs
             actual_end_date, end_nav = end_obs
+            window_key = (actual_start_date, actual_end_date)
 
-            if actual_end_date > actual_start_date and start_nav > Decimal("0") and end_nav > Decimal("0"):
+            if (
+                window_key not in seen_windows
+                and actual_end_date > actual_start_date
+                and start_nav > Decimal("0")
+                and end_nav > Decimal("0")
+            ):
+                seen_windows.add(window_key)
                 elapsed = (actual_end_date - actual_start_date).days
                 if annualized and elapsed >= 365:
                     ratio = float(end_nav / start_nav)
