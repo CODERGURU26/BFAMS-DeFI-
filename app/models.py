@@ -192,7 +192,7 @@ class MfNav(Base):
         ForeignKey("mf_schemes.id"), primary_key=True
     )
     nav_date: Mapped[date] = mapped_column(Date, primary_key=True)
-    nav: Mapped[Decimal] = mapped_column(Numeric(20, 6))
+    nav: Mapped[Decimal] = mapped_column(Numeric(24, 10))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
