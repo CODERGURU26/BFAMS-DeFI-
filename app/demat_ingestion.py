@@ -240,6 +240,59 @@ def _infer_asset_type(symbol: Optional[str], isin: Optional[str], name: Optional
     return "EQUITY"
 
 
+# Dhan Holdings CSV column aliases (overrides defaults)
+_DHAN_HOLDINGS_ALIASES: Dict[str, List[str]] = {
+    "asset_name": ["Scrip Name", "scrip_name"],
+    "isin": ["ISIN Code", "isin_code"],
+    "quantity": ["Free Holding", "free_holding"],
+    "price": ["Closing Price", "closing_price"],
+    "market_value": ["Valuation", "valuation"],
+}
+
+# Dhan Trades CSV column aliases
+_DHAN_TRADES_ALIASES: Dict[str, List[str]] = {
+    "date": ["Date", "date"],
+    "type": ["Side", "side"],
+    "asset_name": ["Scrip Name", "scrip_name"],
+    "quantity": ["Quantity", "quantity"],
+    "price": ["Trade Price", "trade_price"],
+    "market_value": ["Trade Value", "trade_value"],
+}
+
+
+def _strip_dhan_metadata_header(csv_text: str) -> str:
+    """
+    Dhan CSV files start with metadata rows before the actual column header,
+    and end with summary / note footer rows.
+    Detect and strip those rows, returning text beginning at the real header row
+    and omitting summary/note footers.
+    """
+    known_headers = {
+        "scrip name", "isin code", "free holding", "closing price",
+        "date", "side", "trade price", "trade value",
+        "symbol", "isin", "quantity", "price", "market_value",
+    }
+    lines = csv_text.splitlines()
+    header_idx = None
+    for i, line in enumerate(lines):
+        lower = line.lower()
+        if any(tok in lower for tok in known_headers):
+            header_idx = i
+            break
+    if header_idx is None:
+        return csv_text
+
+    kept = []
+    footer_keywords = ("valuation,", "note :", "note:")
+    for line in lines[header_idx:]:
+        stripped = line.strip()
+        lower = stripped.lower()
+        if any(lower.startswith(kw) for kw in footer_keywords):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def parse_holdings_csv(
     csv_text: str,
     statement_date: Optional[date] = None,
@@ -250,7 +303,8 @@ def parse_holdings_csv(
     Parses holdings snapshot CSV text.
     Returns (accepted_holdings, row_errors, duplicate_count).
     """
-    reader = csv.DictReader(io.StringIO(csv_text))
+    cleaned_csv = _strip_dhan_metadata_header(csv_text)
+    reader = csv.DictReader(io.StringIO(cleaned_csv))
     if not reader.fieldnames:
         return [], [RowError(1, None, None, "CSV has empty header")], 0
 
@@ -348,7 +402,8 @@ def parse_transactions_csv(
     Parses trade transactions ledger CSV text.
     Returns (accepted_transactions, row_errors, duplicate_count).
     """
-    reader = csv.DictReader(io.StringIO(csv_text))
+    cleaned_csv = _strip_dhan_metadata_header(csv_text)
+    reader = csv.DictReader(io.StringIO(cleaned_csv))
     if not reader.fieldnames:
         return [], [RowError(1, None, None, "CSV has empty header")], 0
 
@@ -434,15 +489,21 @@ def ingest_demat_holdings(
     statement_date: Optional[date] = None,
     dry_run: bool = False,
     custom_aliases: Optional[Dict[str, List[str]]] = None,
+    parser: str = "generic",
 ) -> IngestionSummary:
     """
     Ingests demat holdings into investment_holdings table.
     - If dry_run=True, performs full parsing & validation with zero DB writes.
     - Detects database duplicates for (account_id, asset_identifier, observed_at).
     """
-    accepted, errors, file_dups = parse_holdings_csv(
-        csv_text, statement_date=statement_date, custom_aliases=custom_aliases
-    )
+    if parser == "dhan":
+        accepted, errors, file_dups = parse_dhan_holdings_csv(
+            csv_text, statement_date=statement_date
+        )
+    else:
+        accepted, errors, file_dups = parse_holdings_csv(
+            csv_text, statement_date=statement_date, custom_aliases=custom_aliases
+        )
 
     if dry_run or not accepted:
         return IngestionSummary(
@@ -514,56 +575,7 @@ def ingest_demat_holdings(
 # Dhan-specific CSV parsers
 # ---------------------------------------------------------------------------
 
-# Dhan Holdings CSV column aliases (overrides defaults)
-_DHAN_HOLDINGS_ALIASES: Dict[str, List[str]] = {
-    "asset_name": ["Scrip Name", "scrip_name"],
-    "isin": ["ISIN Code", "isin_code"],
-    "quantity": ["Free Holding", "free_holding"],
-    "price": ["Closing Price", "closing_price"],
-    "market_value": ["Valuation", "valuation"],
-}
 
-# Dhan Trades CSV column aliases
-_DHAN_TRADES_ALIASES: Dict[str, List[str]] = {
-    "date": ["Date", "date"],
-    "type": ["Side", "side"],
-    "asset_name": ["Scrip Name", "scrip_name"],
-    "quantity": ["Quantity", "quantity"],
-    "price": ["Trade Price", "trade_price"],
-    "market_value": ["Trade Value", "trade_value"],
-}
-
-
-def _strip_dhan_metadata_header(csv_text: str) -> str:
-    """
-    Dhan CSV files start with metadata rows before the actual column header.
-    Detect and strip those rows, returning text beginning at the real header row.
-
-    Holdings format:
-        Row 1: "Holding summary,For 14-10-2026"
-        Row 2-5: Name/UCC/Mobile/Email metadata
-        Row 6: blank
-        Row 7: actual column header ("Scrip Name,ISIN Code,...")
-
-    Trades format:
-        Row 1: actual column header ("Date,Side,...")
-
-    Detection: if the first line does NOT look like a CSV header containing
-    known column keywords, skip lines until we find one that does.
-    """
-    known_headers = {
-        "scrip name", "isin code", "free holding", "closing price",
-        "date", "side", "trade price", "trade value",
-        "symbol", "isin", "quantity", "price", "market_value",
-    }
-    lines = csv_text.splitlines()
-    for i, line in enumerate(lines):
-        lower = line.lower()
-        # Check if any known header token appears in this line
-        if any(tok in lower for tok in known_headers):
-            return "\n".join(lines[i:])
-    # Fallback: return as-is
-    return csv_text
 
 
 def parse_dhan_holdings_csv(

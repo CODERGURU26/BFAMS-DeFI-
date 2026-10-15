@@ -1,4 +1,4 @@
-﻿"""
+"""
 Portfolio routes — Dhan demat holdings & trades ingestion + valuation.
 
 All write endpoints require an `account_id` query parameter pointing to an
@@ -195,13 +195,7 @@ async def ingest_holdings(
         csv_text=csv_text,
         statement_date=statement_date,
         dry_run=dry_run,
-        custom_aliases={
-            "asset_name": ["Scrip Name", "scrip_name"],
-            "isin": ["ISIN Code", "isin_code"],
-            "quantity": ["Free Holding", "free_holding"],
-            "price": ["Closing Price", "closing_price"],
-            "market_value": ["Valuation", "valuation"],
-        },
+        parser="dhan",
     )
     return _summary_to_response(summary)
 

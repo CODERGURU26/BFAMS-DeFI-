@@ -1,4 +1,4 @@
-﻿"""
+"""
 test_dhan_portfolio.py
 ======================
 Comprehensive tests for Dhan demat CSV parsing, transaction ingestion,
@@ -640,9 +640,27 @@ class TestPortfolioEndpoints(unittest.TestCase):
         self.assertEqual(body["accepted_count"], 4)
 
     def test_get_holdings_empty_before_ingest(self):
-        resp = self.client.get(f"/portfolio/holdings/{self.account_id}")
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json(), [])
+        with Session(self.engine) as session:
+            empty_acc = FinancialAccount(
+                connection_id=self.connection_id,
+                account_type="DEMAT",
+                account_name="Empty Test Demat",
+            )
+            session.add(empty_acc)
+            session.commit()
+            empty_id = empty_acc.id
+
+        try:
+            resp = self.client.get(f"/portfolio/holdings/{empty_id}")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json(), [])
+        finally:
+            with Session(self.engine) as session:
+                session.execute(
+                    text("DELETE FROM financial_accounts WHERE id = :id"),
+                    {"id": empty_id},
+                )
+                session.commit()
 
     def test_get_holdings_after_ingest_returns_rows(self):
         # Ingest (live) first
