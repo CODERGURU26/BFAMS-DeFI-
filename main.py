@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import text
 from database import engine
-from app.routes import accounts, transactions, connections, mf_analytics
+from app.routes import accounts, transactions, connections, mf_analytics, portfolio
 
 app = FastAPI(
     title="BFAMS-DeFi API",
@@ -13,6 +13,7 @@ app.include_router(accounts.router)
 app.include_router(transactions.router)
 app.include_router(connections.router)
 app.include_router(mf_analytics.router)
+app.include_router(portfolio.router)
 
 
 @app.get("/")

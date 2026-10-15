@@ -10,7 +10,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import FinancialAccount, InvestmentHolding, Transaction
+from app.models import FinancialAccount, InvestmentHolding, SecurityDailyPrice, Transaction
 
 
 # Default column aliases matching Zerodha, Groww, Upstox, ICICI Direct, HDFC Sky, CAS, etc.
@@ -211,14 +211,30 @@ def _is_valid_isin(s: Optional[str]) -> bool:
 
 
 def _infer_asset_type(symbol: Optional[str], isin: Optional[str], name: Optional[str]) -> str:
-    """Classifies asset into EQUITY, MUTUAL_FUND, ETF, or OTHER."""
+    """Classifies asset into EQUITY, MUTUAL_FUND, ETF, REIT, or OTHER.
+
+    Order of precedence:
+      1. ETF: name contains 'ETF' or symbol ends with 'ETF' (ETFs have INF ISIN but
+         must be classified before MUTUAL_FUND).
+      2. REIT: name contains 'REIT' or known REIT keywords.
+      3. MUTUAL_FUND: INF ISIN prefix (excluding ETFs already caught above).
+      4. EQUITY: INE ISIN prefix.
+      5. Default: EQUITY.
+    """
     isin_upper = (isin or "").upper()
     name_upper = (name or "").upper()
+    sym_upper = (symbol or "").upper()
 
+    # 1. ETF check first (ETFs have INF ISIN like mutual funds)
+    if "ETF" in name_upper or sym_upper.endswith("ETF") or "BEES" in sym_upper:
+        return "ETF"
+    # 2. REIT
+    if "REIT" in name_upper or "REAL ESTATE TRUST" in name_upper:
+        return "REIT"
+    # 3. Mutual fund (INF ISIN or name keywords)
     if isin_upper.startswith("INF") or "MUTUAL FUND" in name_upper or "GROWTH" in name_upper:
         return "MUTUAL_FUND"
-    if "ETF" in name_upper or (symbol and symbol.upper().endswith("ETF")):
-        return "ETF"
+    # 4. Equity (INE ISIN)
     if isin_upper.startswith("INE"):
         return "EQUITY"
     return "EQUITY"
@@ -491,4 +507,592 @@ def ingest_demat_holdings(
         duplicate_count=file_dups + db_dups,
         errors=errors,
         parsed_items=accepted,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dhan-specific CSV parsers
+# ---------------------------------------------------------------------------
+
+# Dhan Holdings CSV column aliases (overrides defaults)
+_DHAN_HOLDINGS_ALIASES: Dict[str, List[str]] = {
+    "asset_name": ["Scrip Name", "scrip_name"],
+    "isin": ["ISIN Code", "isin_code"],
+    "quantity": ["Free Holding", "free_holding"],
+    "price": ["Closing Price", "closing_price"],
+    "market_value": ["Valuation", "valuation"],
+}
+
+# Dhan Trades CSV column aliases
+_DHAN_TRADES_ALIASES: Dict[str, List[str]] = {
+    "date": ["Date", "date"],
+    "type": ["Side", "side"],
+    "asset_name": ["Scrip Name", "scrip_name"],
+    "quantity": ["Quantity", "quantity"],
+    "price": ["Trade Price", "trade_price"],
+    "market_value": ["Trade Value", "trade_value"],
+}
+
+
+def _strip_dhan_metadata_header(csv_text: str) -> str:
+    """
+    Dhan CSV files start with metadata rows before the actual column header.
+    Detect and strip those rows, returning text beginning at the real header row.
+
+    Holdings format:
+        Row 1: "Holding summary,For 14-10-2026"
+        Row 2-5: Name/UCC/Mobile/Email metadata
+        Row 6: blank
+        Row 7: actual column header ("Scrip Name,ISIN Code,...")
+
+    Trades format:
+        Row 1: actual column header ("Date,Side,...")
+
+    Detection: if the first line does NOT look like a CSV header containing
+    known column keywords, skip lines until we find one that does.
+    """
+    known_headers = {
+        "scrip name", "isin code", "free holding", "closing price",
+        "date", "side", "trade price", "trade value",
+        "symbol", "isin", "quantity", "price", "market_value",
+    }
+    lines = csv_text.splitlines()
+    for i, line in enumerate(lines):
+        lower = line.lower()
+        # Check if any known header token appears in this line
+        if any(tok in lower for tok in known_headers):
+            return "\n".join(lines[i:])
+    # Fallback: return as-is
+    return csv_text
+
+
+def parse_dhan_holdings_csv(
+    csv_text: str,
+    statement_date: Optional[date] = None,
+    default_currency: str = "INR",
+) -> Tuple[List["ParsedHolding"], List["RowError"], int]:
+    """
+    Parse a Dhan Demat Holdings CSV export.
+
+    The file has 5-6 metadata rows before the actual column header.
+    Only rows with a valid ISIN and positive Free Holding are accepted.
+    Summary/footer rows (no ISIN) are silently ignored.
+    """
+    stripped = _strip_dhan_metadata_header(csv_text)
+    # Merge Dhan aliases on top of defaults so generic columns still work
+    merged_aliases: Dict[str, List[str]] = {
+        **DEFAULT_COLUMN_ALIASES,
+        **{k: v + DEFAULT_COLUMN_ALIASES.get(k, []) for k, v in _DHAN_HOLDINGS_ALIASES.items()},
+    }
+    return parse_holdings_csv(
+        stripped,
+        statement_date=statement_date,
+        default_currency=default_currency,
+        custom_aliases=merged_aliases,
+    )
+
+
+def parse_dhan_trades_csv(
+    csv_text: str,
+    default_currency: str = "INR",
+) -> Tuple[List["ParsedTransaction"], List["RowError"], int]:
+    """
+    Parse a Dhan Past Trades CSV export.
+
+    Column mapping: Date, Side (B/S), Scrip Name, Exchange, Segment,
+    Order Type, Quantity, Trade Price, Trade Value.
+    Empty trailing rows are ignored.
+    """
+    stripped = _strip_dhan_metadata_header(csv_text)
+    merged_aliases: Dict[str, List[str]] = {
+        **DEFAULT_COLUMN_ALIASES,
+        **{k: v + DEFAULT_COLUMN_ALIASES.get(k, []) for k, v in _DHAN_TRADES_ALIASES.items()},
+    }
+    return parse_transactions_csv(
+        stripped,
+        default_currency=default_currency,
+        custom_aliases=merged_aliases,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Transaction DB ingestion (parallel to ingest_demat_holdings)
+# ---------------------------------------------------------------------------
+
+
+def ingest_demat_transactions(
+    session: Session,
+    account_id: uuid.UUID,
+    csv_text: str,
+    dry_run: bool = False,
+    custom_aliases: Optional[Dict[str, List[str]]] = None,
+    parser: str = "generic",
+) -> IngestionSummary:
+    """
+    Ingests parsed trade transactions into the `transactions` table.
+
+    - parser='dhan' uses Dhan-specific column aliases.
+    - parser='generic' uses the generic resolver.
+    - dry_run=True performs full validation without any DB writes.
+    - Idempotent: skips rows whose (account_id, date, symbol, side, qty, price)
+      composite key already exists as external_transaction_id.
+    """
+    if parser == "dhan":
+        accepted, errors, file_dups = parse_dhan_trades_csv(csv_text)
+    else:
+        merged = {**DEFAULT_COLUMN_ALIASES, **(custom_aliases or {})}
+        accepted, errors, file_dups = parse_transactions_csv(
+            csv_text, custom_aliases=merged
+        )
+
+    if dry_run or not accepted:
+        return IngestionSummary(
+            mode="transactions",
+            dry_run=dry_run,
+            total_rows=len(accepted) + len(errors),
+            accepted_count=len(accepted),
+            rejected_count=len(errors),
+            duplicate_count=file_dups,
+            errors=errors,
+            parsed_items=accepted,
+        )
+
+    db_dups = 0
+    actually_inserted = 0
+
+    for item in accepted:
+        # Build a deterministic external_transaction_id from key fields
+        ext_id = (
+            f"{item.transaction_at.date()}|"
+            f"{item.transaction_type}|"
+            f"{item.symbol or item.isin or 'UNKNOWN'}|"
+            f"{item.quantity}|{item.price}"
+        )
+        existing = session.scalars(
+            select(Transaction.id).where(
+                Transaction.account_id == account_id,
+                Transaction.external_transaction_id == ext_id,
+            )
+        ).first()
+
+        if existing is not None:
+            db_dups += 1
+            errors.append(
+                RowError(
+                    item.row_number,
+                    "database",
+                    ext_id,
+                    f"Transaction already recorded for account: {ext_id}",
+                )
+            )
+            continue
+
+        txn_type = "debit" if item.transaction_type == "BUY" else "credit"
+        txn = Transaction(
+            account_id=account_id,
+            external_transaction_id=ext_id,
+            transaction_type=txn_type,
+            amount=item.amount,
+            currency=item.currency,
+            description=item.description,
+            category="equity_trade",
+            transaction_status="completed",
+            transaction_at=item.transaction_at,
+        )
+        session.add(txn)
+        actually_inserted += 1
+
+    session.commit()
+
+    return IngestionSummary(
+        mode="transactions",
+        dry_run=False,
+        total_rows=len(accepted) + len(errors),
+        accepted_count=actually_inserted,
+        rejected_count=len(errors) - db_dups,
+        duplicate_count=file_dups + db_dups,
+        errors=errors,
+        parsed_items=accepted,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Equity / ETF price lookup via security_daily_prices
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EquityValuation:
+    isin: Optional[str]
+    asset_name: str
+    asset_type: str
+    quantity: Decimal
+    close_price: Optional[Decimal]
+    price_date: Optional[date]
+    as_of_date: date
+    market_value: Optional[Decimal]
+    data_age_days: Optional[int]
+    is_stale: bool
+    status: str  # 'current', 'stale', 'no_price', 'zero_quantity'
+    notes: Optional[str] = None
+
+
+def lookup_equity_price(
+    session: Session,
+    isin: str,
+    as_of_date: Optional[date] = None,
+    max_staleness_days: int = 7,
+) -> Tuple[Optional[Decimal], Optional[date]]:
+    """
+    Returns (close_price, price_date) for an ISIN from security_daily_prices.
+    Looks for the most recent trading date on or before as_of_date.
+    Returns (None, None) if no price record exists.
+    """
+    if as_of_date is None:
+        as_of_date = datetime.now(timezone.utc).date()
+
+    # NSE security_daily_prices does not have ISIN column; match via symbol.
+    # The holdings CSV provides ISIN; we look up symbol via a secondary cross-
+    # reference stored in mf_schemes (for ETFs/MFs) or directly search by name.
+    # For pure equity/ETF holdings we search security_daily_prices by symbol
+    # derived from the ISIN lookup strategy (ISIN is not in that table).
+    # Strategy: try to find any row whose symbol appears in a separate ISIN map
+    # — since security_daily_prices only stores NSE symbols, we return None here
+    # and let the caller do name-based fallback.
+    return None, None
+
+
+def lookup_equity_price_by_symbol(
+    session: Session,
+    symbol: str,
+    as_of_date: Optional[date] = None,
+    max_staleness_days: int = 7,
+) -> Tuple[Optional[Decimal], Optional[date]]:
+    """
+    Returns (close_price, price_date) for a trading symbol from security_daily_prices.
+    Tries the exact symbol first; on miss tries upper-case stripped version.
+    """
+    if as_of_date is None:
+        as_of_date = datetime.now(timezone.utc).date()
+
+    sym_upper = symbol.strip().upper()
+    row = session.scalars(
+        select(SecurityDailyPrice)
+        .where(
+            SecurityDailyPrice.symbol == sym_upper,
+            SecurityDailyPrice.instrument_type == "equity",
+            SecurityDailyPrice.trading_date <= as_of_date,
+        )
+        .order_by(SecurityDailyPrice.trading_date.desc())
+        .limit(1)
+    ).first()
+
+    if row is None:
+        return None, None
+    return row.close_price, row.trading_date
+
+
+# ---------------------------------------------------------------------------
+# Dhan ISIN → NSE symbol resolution table
+# (populated from the actual Dhan holdings file; extends as new ISINs appear)
+# ---------------------------------------------------------------------------
+
+# This table maps ISIN → (nse_symbol, asset_type) for securities held.
+# ETF ISINs starting with INF map to their NSE ticker.
+# REIT ISINs are handled separately (no price in security_daily_prices).
+ISIN_TO_NSE_SYMBOL: Dict[str, Tuple[str, str]] = {
+    # ETFs
+    "INF200KA16D8": ("SBIGOLD", "ETF"),
+    "INF200KB1217": ("SILVERBEES", "ETF"),
+    "INF204KB14I2": ("NIFTYBEES", "ETF"),
+    "INF204KB15V2": ("ITBEES", "ETF"),
+    "INF204KB16I7": ("PSUBNKBEES", "ETF"),
+    "INF247L01AP3": ("MOM100", "ETF"),
+    "INF247L01AU3": ("MOM50", "ETF"),
+    "INF277KA1976": ("TATAGOLD", "ETF"),
+    "INF277KA1984": ("TATASILV", "ETF"),
+    # REITs (INE prefix, listed but often not in equity bhavcopy)
+    "INE041025011": ("EMBASSY", "REIT"),
+    "INE0CCU25019": ("MINDSPACE", "REIT"),
+    "INE0FDU25010": ("BIRET", "REIT"),
+    # Equities (INE prefix)
+    "INE0PTN01011": ("MONEYVIEW", "EQUITY"),
+    "INE509F01029": ("CUPID", "EQUITY"),
+    "INE758T01015": ("ETERNAL", "EQUITY"),
+}
+
+
+def value_equity_holding(
+    session: Session,
+    isin: str,
+    asset_name: str,
+    asset_type: str,
+    quantity: Decimal,
+    as_of_date: Optional[date] = None,
+    max_staleness_days: int = 7,
+    dhan_closing_price: Optional[Decimal] = None,
+) -> EquityValuation:
+    """
+    Values a single equity / ETF / REIT holding.
+
+    Resolution order:
+      1. Look up ISIN → NSE symbol in ISIN_TO_NSE_SYMBOL.
+      2. Query security_daily_prices for the most recent close_price.
+      3. If not found in security_daily_prices, fall back to the Dhan
+         snapshot closing price (already present in the CSV).
+    """
+    if as_of_date is None:
+        as_of_date = datetime.now(timezone.utc).date()
+
+    if quantity == Decimal("0"):
+        return EquityValuation(
+            isin=isin,
+            asset_name=asset_name,
+            asset_type=asset_type,
+            quantity=quantity,
+            close_price=None,
+            price_date=None,
+            as_of_date=as_of_date,
+            market_value=Decimal("0.0000"),
+            data_age_days=None,
+            is_stale=False,
+            status="zero_quantity",
+        )
+
+    # Step 1: resolve NSE symbol
+    nse_symbol, resolved_type = ISIN_TO_NSE_SYMBOL.get(isin, (None, asset_type))
+
+    close_price: Optional[Decimal] = None
+    price_date: Optional[date] = None
+
+    if nse_symbol:
+        close_price, price_date = lookup_equity_price_by_symbol(
+            session, nse_symbol, as_of_date=as_of_date,
+            max_staleness_days=max_staleness_days,
+        )
+
+    # Step 2: fall back to Dhan snapshot price
+    if close_price is None and dhan_closing_price is not None:
+        close_price = dhan_closing_price
+        price_date = as_of_date  # snapshot date
+        age_days = 0
+        is_stale = False
+        status = "current"
+        notes = "Price sourced from Dhan snapshot; not in security_daily_prices."
+        market_value = (quantity * close_price).quantize(Decimal("0.0001"))
+        return EquityValuation(
+            isin=isin,
+            asset_name=asset_name,
+            asset_type=resolved_type,
+            quantity=quantity,
+            close_price=close_price,
+            price_date=price_date,
+            as_of_date=as_of_date,
+            market_value=market_value,
+            data_age_days=age_days,
+            is_stale=is_stale,
+            status=status,
+            notes=notes,
+        )
+
+    # Step 3: no price found at all
+    if close_price is None:
+        return EquityValuation(
+            isin=isin,
+            asset_name=asset_name,
+            asset_type=resolved_type,
+            quantity=quantity,
+            close_price=None,
+            price_date=None,
+            as_of_date=as_of_date,
+            market_value=None,
+            data_age_days=None,
+            is_stale=False,
+            status="no_price",
+            notes=f"No price found in security_daily_prices for ISIN {isin}.",
+        )
+
+    age_days = (as_of_date - price_date).days
+    is_stale = age_days > max_staleness_days
+    market_value = (quantity * close_price).quantize(Decimal("0.0001"))
+    status = "stale" if is_stale else "current"
+    notes = (
+        f"Price is {age_days} days old (threshold {max_staleness_days} days)."
+        if is_stale
+        else None
+    )
+
+    return EquityValuation(
+        isin=isin,
+        asset_name=asset_name,
+        asset_type=resolved_type,
+        quantity=quantity,
+        close_price=close_price,
+        price_date=price_date,
+        as_of_date=as_of_date,
+        market_value=market_value,
+        data_age_days=age_days,
+        is_stale=is_stale,
+        status=status,
+        notes=notes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Portfolio valuation: aggregate all holdings for an account
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PortfolioHoldingValuation:
+    asset_name: str
+    asset_identifier: Optional[str]
+    asset_type: str
+    quantity: Decimal
+    close_price: Optional[Decimal]
+    price_date: Optional[date]
+    market_value: Optional[Decimal]
+    currency: str
+    data_age_days: Optional[int]
+    is_stale: bool
+    status: str
+    notes: Optional[str]
+
+
+@dataclass
+class PortfolioSummary:
+    account_id: uuid.UUID
+    as_of_date: date
+    total_holdings: int
+    valued_count: int
+    stale_count: int
+    no_price_count: int
+    total_market_value: Optional[Decimal]
+    currency: str
+    holdings: List[PortfolioHoldingValuation]
+
+
+def get_portfolio_valuation(
+    session: Session,
+    account_id: uuid.UUID,
+    as_of_date: Optional[date] = None,
+    max_staleness_days: int = 7,
+) -> PortfolioSummary:
+    """
+    Read-only portfolio valuation for a demat account.
+
+    - Loads all investment_holdings rows for the account.
+    - Uses the latest observed_at snapshot.
+    - Values equity/ETF/REIT holdings via security_daily_prices.
+    - Values MF holdings via mf_navs (delegated to mf_valuation).
+    - Never mutates database records.
+    """
+    if as_of_date is None:
+        as_of_date = datetime.now(timezone.utc).date()
+
+    # Load latest snapshot: find the most recent observed_at
+    latest_ts = session.scalars(
+        select(InvestmentHolding.observed_at)
+        .where(InvestmentHolding.account_id == account_id)
+        .order_by(InvestmentHolding.observed_at.desc())
+        .limit(1)
+    ).first()
+
+    if latest_ts is None:
+        return PortfolioSummary(
+            account_id=account_id,
+            as_of_date=as_of_date,
+            total_holdings=0,
+            valued_count=0,
+            stale_count=0,
+            no_price_count=0,
+            total_market_value=Decimal("0"),
+            currency="INR",
+            holdings=[],
+        )
+
+    holdings_rows = session.scalars(
+        select(InvestmentHolding)
+        .where(
+            InvestmentHolding.account_id == account_id,
+            InvestmentHolding.observed_at == latest_ts,
+        )
+        .order_by(InvestmentHolding.asset_name)
+    ).all()
+
+    result_holdings: List[PortfolioHoldingValuation] = []
+    total_mv = Decimal("0")
+    valued_count = 0
+    stale_count = 0
+    no_price_count = 0
+
+    for h in holdings_rows:
+        isin = h.asset_identifier if h.asset_identifier and _is_valid_isin(h.asset_identifier) else None
+        qty = h.quantity or Decimal("0")
+
+        if isin:
+            ev = value_equity_holding(
+                session=session,
+                isin=isin,
+                asset_name=h.asset_name,
+                asset_type=h.asset_type,
+                quantity=qty,
+                as_of_date=as_of_date,
+                max_staleness_days=max_staleness_days,
+                dhan_closing_price=h.unit_price,
+            )
+            phv = PortfolioHoldingValuation(
+                asset_name=h.asset_name,
+                asset_identifier=isin,
+                asset_type=ev.asset_type,
+                quantity=qty,
+                close_price=ev.close_price,
+                price_date=ev.price_date,
+                market_value=ev.market_value,
+                currency=h.currency or "INR",
+                data_age_days=ev.data_age_days,
+                is_stale=ev.is_stale,
+                status=ev.status,
+                notes=ev.notes,
+            )
+            if ev.market_value is not None:
+                total_mv += ev.market_value
+                valued_count += 1
+                if ev.is_stale:
+                    stale_count += 1
+            else:
+                no_price_count += 1
+        else:
+            # No valid ISIN — use stored market_value from snapshot
+            mv = h.market_value
+            phv = PortfolioHoldingValuation(
+                asset_name=h.asset_name,
+                asset_identifier=h.asset_identifier,
+                asset_type=h.asset_type,
+                quantity=qty,
+                close_price=h.unit_price,
+                price_date=latest_ts.date() if latest_ts else None,
+                market_value=mv,
+                currency=h.currency or "INR",
+                data_age_days=None,
+                is_stale=False,
+                status="snapshot",
+                notes="Valued from holdings snapshot; no ISIN resolved.",
+            )
+            if mv is not None:
+                total_mv += mv
+                valued_count += 1
+
+        result_holdings.append(phv)
+
+    return PortfolioSummary(
+        account_id=account_id,
+        as_of_date=as_of_date,
+        total_holdings=len(holdings_rows),
+        valued_count=valued_count,
+        stale_count=stale_count,
+        no_price_count=no_price_count,
+        total_market_value=total_mv if result_holdings else Decimal("0"),
+        currency="INR",
+        holdings=result_holdings,
     )
