@@ -264,7 +264,7 @@ def parse_equity_bhavcopy(
     Parses equities from NSE bhavcopy CSV text.
     Filters by eligible ordinary equity series (e.g. 'EQ', 'BE') and optional symbols.
     """
-    reader = csv.DictReader(io.StringIO(csv_text))
+    reader = csv.DictReader(csv_text.splitlines())
     if reader.fieldnames:
         reader.fieldnames = [col.strip() for col in reader.fieldnames]
 
@@ -330,7 +330,7 @@ def parse_index_daily(
     """
     Parses indices from NSE index closing CSV text.
     """
-    reader = csv.DictReader(io.StringIO(csv_text))
+    reader = csv.DictReader(csv_text.splitlines())
     if reader.fieldnames:
         reader.fieldnames = [col.strip() for col in reader.fieldnames]
 
