@@ -167,6 +167,12 @@ class TestParseDhanTrades(unittest.TestCase):
         self.assertIn("BUY", sides)
         self.assertIn("SELL", sides)
 
+    def test_scrip_name_is_used_as_trade_symbol(self):
+        accepted, errors, _ = parse_dhan_trades_csv(DHAN_TRADES_CSV)
+        self.assertEqual(errors, [])
+        self.assertTrue(all(trade.symbol for trade in accepted))
+        self.assertEqual(accepted[0].symbol, "TATA SILVER ETF")
+
     def test_trade_price_and_value_parsed(self):
         accepted, _, _ = parse_dhan_trades_csv(DHAN_TRADES_CSV)
         first = accepted[0]  # 2026-01-16 BUY TATA Silver ETF

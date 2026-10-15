@@ -19,6 +19,7 @@ Notes
 import argparse
 import csv
 import io
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -491,10 +492,13 @@ def cmd_trades(session: Session, apply: bool):
 
     db_duplicates = 0
     for item in summary.parsed_items:
+        identifier = item.symbol or item.isin or "UNKNOWN"
+        if item.symbol:
+            identifier = f"NAME:{re.sub(r'[^A-Z0-9]', '', item.symbol.upper())}"
         external_id = (
             f"{item.transaction_at.date()}|"
             f"{item.transaction_type}|"
-            f"{item.symbol or item.isin or 'UNKNOWN'}|"
+            f"{identifier}|"
             f"{item.quantity}|{item.price}"
         )
         if session.scalars(

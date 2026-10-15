@@ -253,6 +253,7 @@ _DHAN_HOLDINGS_ALIASES: Dict[str, List[str]] = {
 _DHAN_TRADES_ALIASES: Dict[str, List[str]] = {
     "date": ["Date", "date"],
     "type": ["Side", "side"],
+    "symbol": ["Scrip Name", "scrip_name"],
     "asset_name": ["Scrip Name", "scrip_name"],
     "quantity": ["Quantity", "quantity"],
     "price": ["Trade Price", "trade_price"],
@@ -674,10 +675,13 @@ def ingest_demat_transactions(
 
     for item in accepted:
         # Build a deterministic external_transaction_id from key fields
+        identifier = item.symbol or item.isin or "UNKNOWN"
+        if parser == "dhan" and item.symbol:
+            identifier = f"NAME:{re.sub(r'[^A-Z0-9]', '', item.symbol.upper())}"
         ext_id = (
             f"{item.transaction_at.date()}|"
             f"{item.transaction_type}|"
-            f"{item.symbol or item.isin or 'UNKNOWN'}|"
+            f"{identifier}|"
             f"{item.quantity}|{item.price}"
         )
         existing = session.scalars(
