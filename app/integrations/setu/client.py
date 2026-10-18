@@ -15,6 +15,8 @@ from app.integrations.setu.exceptions import (
 )
 
 SETU_SANDBOX_BASE_URL = "https://fiu-sandbox.setu.co"
+SETU_TOKEN_URL = "https://orgservice-prod.setu.co/v1/users/login"
+SETU_TOKEN_CLIENT_HEADER = "bridge"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
 
@@ -36,16 +38,13 @@ class SetuClient:
             raise SetuConfigurationError("Setu request timeout must be positive.")
 
         self._client = httpx.Client(
-            base_url=SETU_SANDBOX_BASE_URL,
-            headers={
-                "Content-Type": "application/json",
-                "x-client-id": settings.client_id.get_secret_value(),
-                "x-client-secret": settings.client_secret.get_secret_value(),
-                "x-product-instance-id": settings.product_instance_id.get_secret_value(),
-            },
+            headers={"Content-Type": "application/json"},
             timeout=timeout,
             transport=transport,
         )
+        self._client_id = settings.client_id.get_secret_value()
+        self._client_secret = settings.client_secret.get_secret_value()
+        self._product_instance_id = settings.product_instance_id.get_secret_value()
 
     def close(self) -> None:
         self._client.close()
@@ -68,10 +67,59 @@ class SetuClient:
         if not path.startswith("/") or path.startswith("//"):
             raise SetuConfigurationError("Setu API path must be an absolute API path.")
 
+        if method.upper() == "GET" and path == "/v2/fips":
+            headers = {
+                "x-client-id": self._client_id,
+                "x-client-secret": self._client_secret,
+            }
+        else:
+            headers = {
+                "Authorization": f"Bearer {self._get_access_token()}",
+                "x-product-instance-id": self._product_instance_id,
+            }
+
+        return self._send_request(
+            method,
+            f"{SETU_SANDBOX_BASE_URL}{path}",
+            headers=headers,
+            json=json,
+            params=params,
+            allow_empty=allow_empty,
+        )
+
+    def _get_access_token(self) -> str:
+        payload = self._send_request(
+            "POST",
+            SETU_TOKEN_URL,
+            headers={"client": SETU_TOKEN_CLIENT_HEADER},
+            json={
+                "clientID": self._client_id,
+                "grant_type": "client_credentials",
+                "secret": self._client_secret,
+            },
+        )
+        access_token = payload.get("access_token")
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise SetuMalformedResponseError(
+                "Setu token response is missing an access token."
+            )
+        return access_token.strip()
+
+    def _send_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        json: Mapping[str, Any] | None = None,
+        params: Mapping[str, str] | None = None,
+        allow_empty: bool = False,
+    ) -> dict[str, Any]:
         try:
             response = self._client.request(
                 method,
-                path,
+                url,
+                headers=headers,
                 json=json,
                 params=params,
             )
