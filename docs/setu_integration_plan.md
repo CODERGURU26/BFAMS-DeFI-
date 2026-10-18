@@ -113,6 +113,16 @@ conflict, stop and ask rather than selecting one.
 - `consent_records`: no ORM model is available. Consent persistence must stop
   for schema review if safe storage cannot be implemented with existing
   fields; do not create a table/model without explicit `approved schema`.
+- Consent persistence is approved for the existing `consent_records` table
+  only; its ORM mapping must match the table and no DDL may be run. Consent
+  creation is restricted to a `setu_sandbox` connection with an external ID
+  beginning `SETU-SANDBOX-`. The consent endpoint accepts an explicit VUA and
+  validity duration, optionally a timezone-aware data range; it does not store
+  the VUA. Only a provider response with a valid Setu approval URL and
+  `PENDING` status may create a local pending record. Product-level consent
+  purpose, FI types, consent mode, fetch type, data life, frequency, and
+  redirect settings must be configured and verified in Setu Bridge rather
+  than silently chosen by the application.
 - `DataSyncRun` has no created/updated counts or session ID. These would improve
   observability, but must not be added without schema approval.
 - `account_balances` and `investment_holdings` have no database unique
