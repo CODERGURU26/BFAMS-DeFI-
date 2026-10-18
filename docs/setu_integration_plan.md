@@ -27,7 +27,7 @@ be logged or returned.
 - `app/store.py` stores accounts, transactions, and a `DataSyncRun`, skipping
   existing accounts and transactions.
 - `app/models.py` has users, providers, connections, accounts, transactions,
-  and sync runs. The known schema has no ORM model for `consent_records`.
+  sync runs, and an ORM mapping for the existing `consent_records` table.
 - Existing database dependencies include a main-database dependency and a
   test-database dependency. New Setu routes need a dedicated safe dependency
   that constructs its session from `get_test_engine()` and verifies the test
@@ -56,6 +56,8 @@ be logged or returned.
   after checking the existing route/test conventions in the implementation
   phases.
 - `docs/setu_integration_plan.md` — this document.
+- `scripts/setu_sandbox_setup.py` — preview or create the isolated sandbox
+  provider, user, and connection in the TEST database.
 
 ### Modify
 
@@ -193,7 +195,10 @@ must be resolved before any live request.
 - The existing data model/store supports accounts and transactions but not
   investments/holdings. The user's requested securities/equity holdings scope
   may require explicit schema approval or a later supported data-scope choice.
-- Consent persistence is not represented in the current ORM/schema.
+- `consent_records` maps the existing consent table; consent persistence is
+  limited to that table and does not require schema changes.
+- `scripts/setu_sandbox_setup.py` is dry-run by default. Use `--apply` only
+  after explicit approval to create the sandbox provider, user, and connection.
 - Unauthenticated sandbox routes are acceptable only for local development;
   production requires authentication, authorization, CSRF protections where
   applicable, secure callback handling, secret management, consent lifecycle
