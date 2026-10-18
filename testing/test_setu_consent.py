@@ -21,6 +21,7 @@ from app.routes.setu import (
     request_consent,
     request_data_session,
     request_fi_fetch,
+    sync_fi_data,
 )
 
 
@@ -660,6 +661,114 @@ class TestSetuConsent(unittest.TestCase):
                 client = mock_setu_client(response)
                 with self.assertRaises(SetuMalformedResponseError):
                     get_fi_fetch_status(client, record)
+
+    def test_sync_route_uses_store_only_after_ready_and_returns_counts(self):
+        session = FakeSession()
+        client = mock_setu_client({})
+        client.request.side_effect = [
+            {"id": "consent-123", "status": "ACTIVE"},
+            {"status": "COMPLETED", "consentId": "consent-123"},
+            {
+                "id": "session-456",
+                "consentId": "consent-123",
+                "status": "COMPLETED",
+                "format": "json",
+                "fips": [
+                    {
+                        "accounts": [
+                            {
+                                "status": "DELIVERED",
+                                "data": {
+                                    "account": {
+                                        "linkedAccRef": "synthetic-account",
+                                        "type": "deposit",
+                                        "summary": {"currency": "INR"},
+                                        "transactions": {
+                                            "transaction": [
+                                                {
+                                                    "txnId": "synthetic-txn",
+                                                    "type": "CREDIT",
+                                                    "amount": "25",
+                                                    "transactionTimestamp": "2026-01-01T00:00:00Z",
+                                                }
+                                            ]
+                                        },
+                                    }
+                                },
+                            }
+                        ]
+                    }
+                ],
+            },
+        ]
+        run = SimpleNamespace(status="completed", records_processed=2)
+
+        with (
+            patch("app.routes.setu.SetuSettings", return_value=self._settings()),
+            patch("app.routes.setu.SetuClient", return_value=client),
+            patch("app.routes.setu.store_sync", return_value=run) as store,
+        ):
+            result = sync_fi_data("consent-123", "session-456", session)
+
+        self.assertEqual(
+            result,
+            {
+                "status": "completed",
+                "accounts_normalized": 1,
+                "transactions_normalized": 1,
+                "records_processed": 2,
+                "records_rejected": 0,
+                "rejection_counts": {},
+            },
+        )
+        self.assertEqual(store.call_args.args[1], session.connection_id)
+        self.assertEqual(store.call_args.kwargs["sync_type"], "setu_aa")
+        self.assertEqual(len(store.call_args.args[2]), 1)
+        self.assertEqual(len(store.call_args.args[3]["synthetic-account"]), 1)
+
+    def test_sync_route_does_not_store_when_fetch_is_not_ready(self):
+        session = FakeSession()
+        client = mock_setu_client({})
+        client.request.side_effect = [
+            {"id": "consent-123", "status": "ACTIVE"},
+            {"status": "PENDING", "consentId": "consent-123"},
+        ]
+        with (
+            patch("app.routes.setu.SetuSettings", return_value=self._settings()),
+            patch("app.routes.setu.SetuClient", return_value=client),
+            patch("app.routes.setu.store_sync") as store,
+            self.assertRaises(HTTPException) as raised,
+        ):
+            sync_fi_data("consent-123", "session-456", session)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        store.assert_not_called()
+
+    def test_sync_route_refuses_wrong_database_before_store(self):
+        session = FakeSession(database_name="BFAMS-DeFI")
+        session.record.status = "approved"
+        client = mock_setu_client({})
+        client.request.side_effect = [
+            {"id": "consent-123", "status": "ACTIVE"},
+            {"status": "COMPLETED", "consentId": "consent-123"},
+            {
+                "id": "session-456",
+                "consentId": "consent-123",
+                "status": "COMPLETED",
+                "format": "json",
+                "fips": [],
+            },
+        ]
+        with (
+            patch("app.routes.setu.SetuSettings", return_value=self._settings()),
+            patch("app.routes.setu.SetuClient", return_value=client),
+            patch("app.routes.setu.store_sync") as store,
+            self.assertRaises(HTTPException) as raised,
+        ):
+            sync_fi_data("consent-123", "session-456", session)
+
+        self.assertEqual(raised.exception.status_code, 503)
+        store.assert_not_called()
 
 
 if __name__ == "__main__":

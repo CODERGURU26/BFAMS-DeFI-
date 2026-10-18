@@ -1,7 +1,7 @@
 """Setu consent creation and persistence."""
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import quote, urlsplit
 from uuid import UUID
 
@@ -14,6 +14,7 @@ from app.integrations.setu.client import SetuClient
 from app.integrations.setu.exceptions import SetuMalformedResponseError
 from app.integrations.setu.normalizer import normalize_setu_fi_response
 from app.models import ConsentRecord, FinancialConnection
+from app.schemas import NormalizedAccount, NormalizedTransaction
 
 TEST_DATABASE_NAME = "BFAMS-DeFI-test"
 
@@ -354,11 +355,10 @@ def fetch_data_session_summary(
     if status not in {"PARTIAL", "COMPLETED"}:
         raise ValueError("Setu financial data is not ready to fetch.")
 
-    fips = response.get("fips")
-    if not isinstance(fips, list):
-        raise SetuMalformedResponseError("Setu financial data response is invalid.")
-
-    accounts, transactions_by_account, rejected = normalize_setu_fi_response(response)
+    fips = response["fips"]
+    accounts, transactions_by_account, rejected = retrieve_normalized_fi_data(
+        response
+    )
 
     return {
         "status": status.lower(),
@@ -370,3 +370,57 @@ def fetch_data_session_summary(
         ),
         "rejected_count": len(rejected),
     }
+
+
+def retrieve_normalized_fi_data(
+    response: dict[str, Any],
+) -> tuple[
+    list[NormalizedAccount],
+    dict[str, list[NormalizedTransaction]],
+    list[dict[str, Any]],
+]:
+    fips = response.get("fips")
+    if not isinstance(fips, list):
+        raise SetuMalformedResponseError("Setu financial data response is invalid.")
+    status = response.get("status")
+    if not isinstance(status, str) or status.upper() not in {"PARTIAL", "COMPLETED"}:
+        raise ValueError("Setu financial data is not ready to fetch.")
+
+    return normalize_setu_fi_response(response)
+
+
+def fetch_normalized_fi_data(
+    client: SetuClient,
+    record: ConsentRecord,
+    session_id: str,
+) -> tuple[
+    list[NormalizedAccount],
+    dict[str, list[NormalizedTransaction]],
+    list[dict[str, Any]],
+]:
+    if record.status != "approved":
+        raise ValueError("Setu consent must be approved before fetching data.")
+    if not record.external_consent_id or not session_id.strip():
+        raise SetuMalformedResponseError("Setu data session reference is invalid.")
+
+    response = client.request(
+        "GET",
+        f"/v2/sessions/{quote(session_id.strip(), safe='')}",
+    )
+    provider_status = response.get("status")
+    if (
+        response.get("id") != session_id.strip()
+        or response.get("consentId") != record.external_consent_id
+        or not isinstance(provider_status, str)
+        or provider_status.upper() not in {"PARTIAL", "COMPLETED"}
+        or response.get("format") != "json"
+    ):
+        if (
+            isinstance(provider_status, str)
+            and provider_status.upper() in _DATA_SESSION_STATUSES
+            and provider_status.upper() not in {"PARTIAL", "COMPLETED"}
+        ):
+            raise ValueError("Setu financial data is not ready to fetch.")
+        raise SetuMalformedResponseError("Setu data session response is invalid.")
+
+    return retrieve_normalized_fi_data(response)

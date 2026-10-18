@@ -146,6 +146,13 @@ must be resolved before any live request.
   and credit/debit transactions from JSON responses. Other FI types (including
   equity and mutual-fund holdings) are rejected as unsupported; they cannot be
   represented by the current normalized storage pipeline.
+- Explicit `POST /api/setu/consents/{consentId}/sessions/{sessionId}/sync`
+  retrieves normalized supported records only after consent and fetch status
+  are revalidated, checks `current_database()` immediately before persistence,
+  then delegates inserts and sync-run recording to `store_sync()` on the
+  `get_test_engine()` session. `store_sync()` commits internally. Existing
+  account/transaction duplicates are skipped; no existing records are updated
+  or deleted. The response contains counts and rejection reason counts only.
 - `DataSyncRun` has no created/updated counts or session ID. These would improve
   observability, but must not be added without schema approval.
 - `account_balances` and `investment_holdings` have no database unique
