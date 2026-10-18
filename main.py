@@ -7,6 +7,7 @@ from app.routes import (
     connection_wizard,
     mf_analytics,
     portfolio,
+    setu,
     testing_dashboard,
     transactions,
 )
@@ -24,6 +25,7 @@ app.include_router(mf_analytics.router)
 app.include_router(portfolio.router)
 app.include_router(testing_dashboard.router)
 app.include_router(connection_wizard.router)
+app.include_router(setu.router)
 
 
 @app.get("/")
