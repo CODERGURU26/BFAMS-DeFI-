@@ -98,7 +98,7 @@ def create_consent(
             by_alias=True, mode="json"
         )
 
-    response = client.request("POST", "/consents", json=payload)
+    response = client.request("POST", "/v2/consents", json=payload)
     consent_id = response.get("id")
     approval_url = response.get("url")
     status = response.get("status")
@@ -177,7 +177,7 @@ def refresh_consent_status(
         )
     response = client.request(
         "GET",
-        f"/consents/{quote(record.external_consent_id, safe='')}",
+        f"/v2/consents/{quote(record.external_consent_id, safe='')}",
     )
     provider_id = response.get("id")
     provider_status = response.get("status")
@@ -238,7 +238,7 @@ def create_data_session(
 
     response = client.request(
         "POST",
-        "/sessions",
+        "/v2/sessions",
         json={
             "consentId": record.external_consent_id,
             "dataRange": request.data_range.model_dump(
@@ -267,4 +267,74 @@ def create_data_session(
         "session_id": session_id.strip(),
         "consent_id": record.external_consent_id,
         "status": "pending",
+    }
+
+
+_DATA_SESSION_STATUSES = {
+    "PENDING",
+    "PARTIAL",
+    "COMPLETED",
+    "EXPIRED",
+    "FAILED",
+}
+
+
+def fetch_data_session_summary(
+    client: SetuClient,
+    record: ConsentRecord,
+    session_id: str,
+) -> dict[str, str | int]:
+    if record.status != "approved":
+        raise ValueError("Setu consent must be approved before fetching data.")
+    if not record.external_consent_id:
+        raise SetuMalformedResponseError("Stored Setu consent reference is missing.")
+    if not session_id.strip():
+        raise SetuMalformedResponseError("Setu data session reference is invalid.")
+
+    response = client.request(
+        "GET",
+        f"/v2/sessions/{quote(session_id.strip(), safe='')}",
+    )
+    provider_status = response.get("status")
+    if (
+        response.get("id") != session_id.strip()
+        or response.get("consentId") != record.external_consent_id
+        or not isinstance(provider_status, str)
+        or provider_status.upper() not in _DATA_SESSION_STATUSES
+        or response.get("format") not in {"json", "xml"}
+    ):
+        raise SetuMalformedResponseError("Setu data session response is invalid.")
+
+    status = provider_status.upper()
+    if status not in {"PARTIAL", "COMPLETED"}:
+        raise ValueError("Setu financial data is not ready to fetch.")
+
+    fips = response.get("fips")
+    if not isinstance(fips, list):
+        raise SetuMalformedResponseError("Setu financial data response is invalid.")
+
+    account_count = 0
+    data_account_count = 0
+    for fip in fips:
+        if not isinstance(fip, dict) or not isinstance(fip.get("accounts"), list):
+            raise SetuMalformedResponseError("Setu financial data response is invalid.")
+        for account in fip["accounts"]:
+            if not isinstance(account, dict):
+                raise SetuMalformedResponseError(
+                    "Setu financial data response is invalid."
+                )
+            account_count += 1
+            account_data = account.get("data")
+            if account_data is not None:
+                if not isinstance(account_data, dict):
+                    raise SetuMalformedResponseError(
+                        "Setu financial data response is invalid."
+                    )
+                data_account_count += 1
+
+    return {
+        "status": status.lower(),
+        "fi_provider_count": len(fips),
+        "account_count": account_count,
+        "data_account_count": data_account_count,
     }

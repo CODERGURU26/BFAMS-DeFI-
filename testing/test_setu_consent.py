@@ -10,10 +10,12 @@ from app.integrations.setu.service import (
     CreateDataSessionRequest,
     CreateConsentRequest,
     create_data_session,
+    fetch_data_session_summary,
     refresh_consent_status,
 )
+from app.integrations.setu.exceptions import SetuMalformedResponseError
 from app.models import ConsentRecord
-from app.routes.setu import request_consent, request_data_session
+from app.routes.setu import fetch_data_session, request_consent, request_data_session
 
 
 def request_body(connection_id):
@@ -229,7 +231,7 @@ class TestSetuConsent(unittest.TestCase):
         self.assertEqual(session.commit_count, 1)
         self.assertEqual(
             client.request.call_args.args,
-            ("GET", "/consents/consent-123"),
+            ("GET", "/v2/consents/consent-123"),
         )
 
     def test_pending_status_does_not_commit_when_unchanged(self):
@@ -319,7 +321,7 @@ class TestSetuConsent(unittest.TestCase):
 
         self.assertEqual(result["session_id"], "session-456")
         self.assertEqual(result["status"], "pending")
-        self.assertEqual(client.request.call_args.args, ("POST", "/sessions"))
+        self.assertEqual(client.request.call_args.args, ("POST", "/v2/sessions"))
         self.assertEqual(
             client.request.call_args.kwargs["json"],
             {
@@ -384,11 +386,11 @@ class TestSetuConsent(unittest.TestCase):
         self.assertEqual(client.request.call_count, 2)
         self.assertEqual(
             client.request.call_args_list[0].args,
-            ("GET", "/consents/consent-123"),
+            ("GET", "/v2/consents/consent-123"),
         )
         self.assertEqual(
             client.request.call_args_list[1].args,
-            ("POST", "/sessions"),
+            ("POST", "/v2/sessions"),
         )
         self.assertEqual(session.record.status, "approved")
 
@@ -414,6 +416,137 @@ class TestSetuConsent(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(client.request.call_count, 1)
+
+    def test_fetch_summarizes_ready_response_without_returning_payload(self):
+        record = ConsentRecord(
+            id=uuid4(),
+            connection_id=uuid4(),
+            external_consent_id="consent-123",
+            status="approved",
+        )
+        client = mock_setu_client(
+            {
+                "id": "session-456",
+                "consentId": "consent-123",
+                "status": "PARTIAL",
+                "format": "json",
+                "fips": [
+                    {
+                        "accounts": [
+                            {
+                                "status": "DELIVERED",
+                                "data": {
+                                    "account": {
+                                        "profile": {"name": "synthetic-name"},
+                                        "transactions": {"transaction": [{"txnId": "synthetic-id"}]},
+                                    }
+                                },
+                            },
+                            {"status": "PENDING", "data": None},
+                        ]
+                    }
+                ],
+            }
+        )
+
+        result = fetch_data_session_summary(client, record, "session-456")
+
+        self.assertEqual(
+            result,
+            {
+                "status": "partial",
+                "fi_provider_count": 1,
+                "account_count": 2,
+                "data_account_count": 1,
+            },
+        )
+        self.assertNotIn("synthetic-name", str(result))
+        self.assertNotIn("synthetic-id", str(result))
+        self.assertEqual(
+            client.request.call_args.args,
+            ("GET", "/v2/sessions/session-456"),
+        )
+
+    def test_fetch_rejects_not_ready_and_mismatched_session(self):
+        record = ConsentRecord(
+            id=uuid4(),
+            connection_id=uuid4(),
+            external_consent_id="consent-123",
+            status="approved",
+        )
+        client = mock_setu_client(
+            {
+                "id": "session-456",
+                "consentId": "consent-123",
+                "status": "PENDING",
+                "format": "json",
+            }
+        )
+        with self.assertRaises(ValueError):
+            fetch_data_session_summary(client, record, "session-456")
+
+        for response in (
+            {
+                "id": "different-session",
+                "consentId": "consent-123",
+                "status": "COMPLETED",
+                "format": "json",
+                "fips": [],
+            },
+            {
+                "id": "session-456",
+                "consentId": "different-consent",
+                "status": "COMPLETED",
+                "format": "json",
+                "fips": [],
+            },
+        ):
+            with self.subTest(response_id=response["id"]):
+                client = mock_setu_client(response)
+                with self.assertRaises(SetuMalformedResponseError):
+                    fetch_data_session_summary(client, record, "session-456")
+
+    def test_fetch_route_requires_fresh_active_consent(self):
+        session = FakeSession()
+        client = mock_setu_client(
+            {"id": "consent-123", "status": "PENDING"}
+        )
+        with (
+            patch("app.routes.setu.SetuSettings", return_value=self._settings()),
+            patch("app.routes.setu.SetuClient", return_value=client),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            fetch_data_session("consent-123", "session-456", session)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(client.request.call_count, 1)
+
+    def test_fetch_route_returns_only_counts_after_active_consent(self):
+        session = FakeSession()
+        client = mock_setu_client({})
+        client.request.side_effect = [
+            {"id": "consent-123", "status": "ACTIVE"},
+            {
+                "id": "session-456",
+                "consentId": "consent-123",
+                "status": "COMPLETED",
+                "format": "json",
+                "fips": [{"accounts": [{"status": "DELIVERED", "data": {}}]}],
+            },
+        ]
+        with (
+            patch("app.routes.setu.SetuSettings", return_value=self._settings()),
+            patch("app.routes.setu.SetuClient", return_value=client),
+        ):
+            result = fetch_data_session("consent-123", "session-456", session)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["data_account_count"], 1)
+        self.assertEqual(client.request.call_count, 2)
+        self.assertEqual(
+            client.request.call_args_list[1].args,
+            ("GET", "/v2/sessions/session-456"),
+        )
 
 
 if __name__ == "__main__":
