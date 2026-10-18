@@ -32,7 +32,8 @@ be logged or returned.
   test-database dependency. New Setu routes need a dedicated safe dependency
   that constructs its session from `get_test_engine()` and verifies the test
   database before writes.
-- There is no existing `app/integrations/` package or Setu client.
+- Setu integration package/client and consent/session routes have been added
+  in the current implementation phases.
 - Existing storage has no normalized investment-holdings path. The requested
   initial data scope (securities/equity holdings) is not represented by
   `NormalizedAccount` / `NormalizedTransaction` or `store_sync()`.
@@ -92,13 +93,10 @@ No changes to `database.py`'s existing `Settings` class are planned.
 10. Record sync state with the existing `DataSyncRun` columns and expose only
     safe statuses/counts.
 
-The exact URLs, methods, authentication headers, payload shapes, callback
-behavior, lifecycle statuses, session creation, and data retrieval paths remain
-unverified at Phase 1. Before implementing the API client, verify them against
-the current official documentation only:
-`https://docs.setu.co/data/account-aggregator` (quickstart, consent-flow,
-consent-object, and data-apis). If documented authentication mechanisms
-conflict, stop and ask rather than selecting one.
+Consent and data-session request paths and payloads have been checked against
+the official Setu docs and FIU V2 Postman collection. The collection's bearer
+authorization still conflicts with the previously selected header scheme and
+must be resolved before any live request.
 
 ## Database mapping and sandbox isolation
 
@@ -144,6 +142,10 @@ conflict, stop and ask rather than selecting one.
 - The FIU V2 Postman collection configures bearer-token authorization, while
   the existing Setu client uses the header scheme explicitly selected earlier.
   No live request was made; resolve this auth contract before sandbox use.
+- FI data normalization currently accepts stable deposit-account references
+  and credit/debit transactions from JSON responses. Other FI types (including
+  equity and mutual-fund holdings) are rejected as unsupported; they cannot be
+  represented by the current normalized storage pipeline.
 - `DataSyncRun` has no created/updated counts or session ID. These would improve
   observability, but must not be added without schema approval.
 - `account_balances` and `investment_holdings` have no database unique

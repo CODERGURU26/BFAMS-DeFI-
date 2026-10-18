@@ -444,8 +444,19 @@ class TestSetuConsent(unittest.TestCase):
                                 "status": "DELIVERED",
                                 "data": {
                                     "account": {
-                                        "profile": {"name": "synthetic-name"},
-                                        "transactions": {"transaction": [{"txnId": "synthetic-id"}]},
+                                        "linkedAccRef": "synthetic-account",
+                                        "type": "deposit",
+                                        "summary": {"currency": "INR"},
+                                        "transactions": {
+                                            "transaction": [
+                                                {
+                                                    "txnId": "synthetic-id",
+                                                    "amount": "25.50",
+                                                    "type": "CREDIT",
+                                                    "transactionTimestamp": "2026-01-01T00:00:00Z",
+                                                }
+                                            ]
+                                        },
                                     }
                                 },
                             },
@@ -463,11 +474,11 @@ class TestSetuConsent(unittest.TestCase):
             {
                 "status": "partial",
                 "fi_provider_count": 1,
-                "account_count": 2,
-                "data_account_count": 1,
+                "account_count": 1,
+                "transaction_count": 1,
+                "rejected_count": 0,
             },
         )
-        self.assertNotIn("synthetic-name", str(result))
         self.assertNotIn("synthetic-id", str(result))
         self.assertEqual(
             client.request.call_args.args,
@@ -545,7 +556,22 @@ class TestSetuConsent(unittest.TestCase):
                 "consentId": "consent-123",
                 "status": "COMPLETED",
                 "format": "json",
-                "fips": [{"accounts": [{"status": "DELIVERED", "data": {}}]}],
+                "fips": [
+                    {
+                        "accounts": [
+                            {
+                                "status": "DELIVERED",
+                                "data": {
+                                    "account": {
+                                        "linkedAccRef": "synthetic-account",
+                                        "type": "deposit",
+                                        "transactions": {"transaction": []},
+                                    }
+                                },
+                            }
+                        ]
+                    }
+                ],
             },
         ]
         with (
@@ -555,7 +581,7 @@ class TestSetuConsent(unittest.TestCase):
             result = fetch_data_session("consent-123", "session-456", session)
 
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["data_account_count"], 1)
+        self.assertEqual(result["account_count"], 1)
         self.assertEqual(client.request.call_count, 3)
         self.assertEqual(
             client.request.call_args_list[2].args,

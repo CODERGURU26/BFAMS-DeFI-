@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.integrations.setu.client import SetuClient
 from app.integrations.setu.exceptions import SetuMalformedResponseError
+from app.integrations.setu.normalizer import normalize_setu_fi_response
 from app.models import ConsentRecord, FinancialConnection
 
 TEST_DATABASE_NAME = "BFAMS-DeFI-test"
@@ -66,7 +67,7 @@ class CreateDataSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     data_range: ConsentDataRange = Field(alias="dataRange")
-    format: Literal["json", "xml"] = "json"
+    format: Literal["json"] = "json"
 
 
 def is_setu_sandbox_connection(
@@ -357,28 +358,15 @@ def fetch_data_session_summary(
     if not isinstance(fips, list):
         raise SetuMalformedResponseError("Setu financial data response is invalid.")
 
-    account_count = 0
-    data_account_count = 0
-    for fip in fips:
-        if not isinstance(fip, dict) or not isinstance(fip.get("accounts"), list):
-            raise SetuMalformedResponseError("Setu financial data response is invalid.")
-        for account in fip["accounts"]:
-            if not isinstance(account, dict):
-                raise SetuMalformedResponseError(
-                    "Setu financial data response is invalid."
-                )
-            account_count += 1
-            account_data = account.get("data")
-            if account_data is not None:
-                if not isinstance(account_data, dict):
-                    raise SetuMalformedResponseError(
-                        "Setu financial data response is invalid."
-                    )
-                data_account_count += 1
+    accounts, transactions_by_account, rejected = normalize_setu_fi_response(response)
 
     return {
         "status": status.lower(),
         "fi_provider_count": len(fips),
-        "account_count": account_count,
-        "data_account_count": data_account_count,
+        "account_count": len(accounts),
+        "transaction_count": sum(
+            len(transactions)
+            for transactions in transactions_by_account.values()
+        ),
+        "rejected_count": len(rejected),
     }
