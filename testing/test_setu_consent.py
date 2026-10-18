@@ -5,7 +5,12 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
-from app.integrations.setu.service import CreateConsentRequest
+from app.integrations.setu.exceptions import SetuMalformedResponseError
+from app.integrations.setu.service import (
+    CreateConsentRequest,
+    refresh_consent_status,
+)
+from app.models import ConsentRecord
 from app.routes.setu import request_consent
 
 
@@ -186,6 +191,94 @@ class TestSetuConsent(unittest.TestCase):
         }
         with self.assertRaises(ValueError):
             CreateConsentRequest.model_validate(body)
+
+    def test_active_provider_consent_maps_to_approved_and_persists_expiry(self):
+        session = FakeSession()
+        record = ConsentRecord(
+            id=uuid4(),
+            connection_id=session.connection_id,
+            external_consent_id="consent-123",
+            status="pending",
+        )
+        client = mock_setu_client(
+            {
+                "id": "consent-123",
+                "status": "ACTIVE",
+                "detail": {"consentExpiry": "2026-11-18T06:22:17Z"},
+            }
+        )
+
+        result = refresh_consent_status(session, client, record)
+
+        self.assertEqual(result["status"], "approved")
+        self.assertEqual(record.status, "approved")
+        self.assertEqual(
+            record.expires_at.isoformat(),
+            "2026-11-18T06:22:17+00:00",
+        )
+        self.assertEqual(session.commit_count, 1)
+        self.assertEqual(
+            client.request.call_args.args,
+            ("GET", "/consents/consent-123"),
+        )
+
+    def test_pending_status_does_not_commit_when_unchanged(self):
+        session = FakeSession()
+        record = ConsentRecord(
+            id=uuid4(),
+            connection_id=session.connection_id,
+            external_consent_id="consent-123",
+            status="pending",
+        )
+        client = mock_setu_client(
+            {"id": "consent-123", "status": "PENDING"}
+        )
+
+        result = refresh_consent_status(session, client, record)
+
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(session.commit_count, 0)
+
+    def test_rejects_unknown_or_mismatched_provider_status_without_write(self):
+        for response in (
+            {"id": "consent-123", "status": "FAILED"},
+            {"id": "different-consent", "status": "ACTIVE"},
+        ):
+            with self.subTest(response=response):
+                session = FakeSession()
+                record = ConsentRecord(
+                    id=uuid4(),
+                    connection_id=session.connection_id,
+                    external_consent_id="consent-123",
+                    status="pending",
+                )
+                client = mock_setu_client(response)
+
+                with self.assertRaises(SetuMalformedResponseError):
+                    refresh_consent_status(session, client, record)
+
+                self.assertEqual(session.commit_count, 0)
+
+    def test_rejects_naive_expiry_without_write(self):
+        session = FakeSession()
+        record = ConsentRecord(
+            id=uuid4(),
+            connection_id=session.connection_id,
+            external_consent_id="consent-123",
+            status="pending",
+        )
+        client = mock_setu_client(
+            {
+                "id": "consent-123",
+                "status": "ACTIVE",
+                "detail": {"consentExpiry": "2026-11-18T06:22:17"},
+            }
+        )
+
+        with self.assertRaises(SetuMalformedResponseError):
+            refresh_consent_status(session, client, record)
+
+        self.assertEqual(session.commit_count, 0)
 
 
 if __name__ == "__main__":

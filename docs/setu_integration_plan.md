@@ -123,6 +123,11 @@ conflict, stop and ask rather than selecting one.
   purpose, FI types, consent mode, fetch type, data life, frequency, and
   redirect settings must be configured and verified in Setu Bridge rather
   than silently chosen by the application.
+- Consent status polling uses the documented Get Consent API with the stored
+  Setu consent reference. Provider statuses are mapped to the existing local
+  status constraint, and only status plus a validated timezone-aware expiry
+  may be persisted. The status route checks the consent's isolated Setu
+  sandbox connection before contacting Setu.
 - `DataSyncRun` has no created/updated counts or session ID. These would improve
   observability, but must not be added without schema approval.
 - `account_balances` and `investment_holdings` have no database unique

@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy import select, text
@@ -148,3 +148,72 @@ def create_consent(
         "approval_url": approval_url,
         "status": "pending",
     }
+
+
+_CONSENT_STATUS_MAP = {
+    "PENDING": "pending",
+    "ACTIVE": "approved",
+    "REJECTED": "rejected",
+    "REVOKED": "revoked",
+    "EXPIRED": "expired",
+}
+
+
+def refresh_consent_status(
+    session: Session,
+    client: SetuClient,
+    record: ConsentRecord,
+) -> dict[str, str]:
+    if not record.external_consent_id:
+        raise SetuMalformedResponseError(
+            "Stored Setu consent reference is missing."
+        )
+    response = client.request(
+        "GET",
+        f"/consents/{quote(record.external_consent_id, safe='')}",
+    )
+    provider_id = response.get("id")
+    provider_status = response.get("status")
+    if (
+        not isinstance(provider_status, str)
+        or provider_status.upper() not in _CONSENT_STATUS_MAP
+        or provider_id != record.external_consent_id
+    ):
+        raise SetuMalformedResponseError(
+            "Setu consent status response is invalid."
+        )
+
+    status = _CONSENT_STATUS_MAP[provider_status.upper()]
+    detail = response.get("detail")
+    expires_at = None
+    if isinstance(detail, dict) and detail.get("consentExpiry") is not None:
+        expiry_value = detail["consentExpiry"]
+        if not isinstance(expiry_value, str):
+            raise SetuMalformedResponseError(
+                "Setu consent expiry is invalid."
+            )
+        try:
+            expires_at = datetime.fromisoformat(expiry_value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise SetuMalformedResponseError(
+                "Setu consent expiry is invalid."
+            ) from exc
+        if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+            raise SetuMalformedResponseError(
+                "Setu consent expiry must include a timezone."
+            )
+
+    if record.status != status or (
+        expires_at is not None and record.expires_at != expires_at
+    ):
+        record.status = status
+        if expires_at is not None:
+            record.expires_at = expires_at
+        try:
+            _verify_test_database(session)
+            session.commit()
+        except (SQLAlchemyError, RuntimeError):
+            session.rollback()
+            raise
+
+    return {"consent_id": record.external_consent_id, "status": status}
