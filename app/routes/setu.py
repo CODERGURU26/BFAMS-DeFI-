@@ -9,6 +9,8 @@ from app.integrations.setu.config import SetuSettings
 from app.integrations.setu.exceptions import SetuError
 from app.integrations.setu.service import (
     CreateConsentRequest,
+    CreateDataSessionRequest,
+    create_data_session,
     create_consent,
     is_setu_sandbox_connection,
     refresh_consent_status,
@@ -151,4 +153,65 @@ def get_consent_status(
         raise HTTPException(
             status_code=502,
             detail="Setu consent status could not be retrieved.",
+        ) from exc
+
+
+@router.post("/consents/{consent_id}/sessions")
+def request_data_session(
+    consent_id: str,
+    request: CreateDataSessionRequest,
+    session: Session = Depends(get_setu_test_db),
+) -> dict[str, str]:
+    settings = SetuSettings()
+    if settings.environment != "sandbox":
+        raise HTTPException(
+            status_code=403,
+            detail="Setu endpoints are available only in the sandbox environment.",
+        )
+    if not settings.has_credentials:
+        raise HTTPException(
+            status_code=503,
+            detail="Setu sandbox configuration is incomplete.",
+        )
+
+    consent_rows = session.execute(
+        select(ConsentRecord, FinancialConnection, DataProvider.provider_code)
+        .join(
+            FinancialConnection,
+            FinancialConnection.id == ConsentRecord.connection_id,
+        )
+        .join(DataProvider, DataProvider.id == FinancialConnection.provider_id)
+        .where(ConsentRecord.external_consent_id == consent_id)
+        .limit(2)
+    ).all()
+    if len(consent_rows) != 1:
+        raise HTTPException(status_code=404, detail="Setu consent not found.")
+
+    record, connection, provider_code = consent_rows[0]
+    user = session.get(User, connection.user_id)
+    user_connection_count = session.scalar(
+        select(func.count())
+        .select_from(FinancialConnection)
+        .where(FinancialConnection.user_id == connection.user_id)
+    )
+    if (
+        user is None
+        or user_connection_count != 1
+        or not is_setu_sandbox_connection(connection, provider_code)
+    ):
+        raise HTTPException(status_code=404, detail="Setu consent not found.")
+
+    try:
+        with SetuClient(settings) as client:
+            consent_status = refresh_consent_status(session, client, record)
+            if consent_status["status"] != "approved":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Setu consent is not approved.",
+                )
+            return create_data_session(client, record, request)
+    except SetuError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Setu data session could not be created.",
         ) from exc

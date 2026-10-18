@@ -110,9 +110,8 @@ conflict, stop and ask rather than selecting one.
   provider-stable external IDs.
 - `DataSyncRun`: use existing connection, sync type, status, timestamps,
   `records_processed`, and `error_message`.
-- `consent_records`: no ORM model is available. Consent persistence must stop
-  for schema review if safe storage cannot be implemented with existing
-  fields; do not create a table/model without explicit `approved schema`.
+- `consent_records`: ORM mapping matches the existing table. Consent persistence
+  was authorized for that existing table only; no DDL may be run.
 - Consent persistence is approved for the existing `consent_records` table
   only; its ORM mapping must match the table and no DDL may be run. Consent
   creation is restricted to a `setu_sandbox` connection with an external ID
@@ -128,6 +127,12 @@ conflict, stop and ask rather than selecting one.
   status constraint, and only status plus a validated timezone-aware expiry
   may be persisted. The status route checks the consent's isolated Setu
   sandbox connection before contacting Setu.
+- Data session creation uses `POST /sessions` only after a fresh Get Consent
+  response reports `ACTIVE`. The requested format and timezone-aware data
+  range are explicit; Setu enforces that the range is within the granted
+  consent. The API returns the provider session ID for the caller to retain.
+  The existing schema has no session-ID field, so sessions are not persisted
+  locally; durable recovery would require a separately approved schema change.
 - `DataSyncRun` has no created/updated counts or session ID. These would improve
   observability, but must not be added without schema approval.
 - `account_balances` and `investment_holdings` have no database unique

@@ -2,8 +2,8 @@
 
 from datetime import datetime
 from typing import Literal
-from uuid import UUID
 from urllib.parse import quote, urlsplit
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy import select, text
@@ -60,6 +60,13 @@ class CreateConsentRequest(BaseModel):
         if not value.get_secret_value().strip():
             raise ValueError("VUA must not be empty.")
         return value
+
+
+class CreateDataSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    data_range: ConsentDataRange = Field(alias="dataRange")
+    format: Literal["json", "xml"] = "json"
 
 
 def is_setu_sandbox_connection(
@@ -217,3 +224,47 @@ def refresh_consent_status(
             raise
 
     return {"consent_id": record.external_consent_id, "status": status}
+
+
+def create_data_session(
+    client: SetuClient,
+    record: ConsentRecord,
+    request: CreateDataSessionRequest,
+) -> dict[str, str]:
+    if record.status != "approved":
+        raise ValueError("Setu consent must be approved before creating a session.")
+    if not record.external_consent_id:
+        raise SetuMalformedResponseError("Stored Setu consent reference is missing.")
+
+    response = client.request(
+        "POST",
+        "/sessions",
+        json={
+            "consentId": record.external_consent_id,
+            "dataRange": request.data_range.model_dump(
+                by_alias=True, mode="json"
+            ),
+            "format": request.format,
+        },
+    )
+    session_id = response.get("id")
+    consent_id = response.get("consentId")
+    session_status = response.get("status")
+    response_format = response.get("format")
+    if (
+        not isinstance(session_id, str)
+        or not session_id.strip()
+        or consent_id != record.external_consent_id
+        or not isinstance(session_status, str)
+        or session_status.upper() != "PENDING"
+        or response_format != request.format
+    ):
+        raise SetuMalformedResponseError(
+            "Setu data session response is invalid."
+        )
+
+    return {
+        "session_id": session_id.strip(),
+        "consent_id": record.external_consent_id,
+        "status": "pending",
+    }
