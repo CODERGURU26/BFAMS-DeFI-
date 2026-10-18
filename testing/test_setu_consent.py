@@ -7,15 +7,21 @@ from fastapi import HTTPException
 
 from app.integrations.setu.exceptions import SetuMalformedResponseError
 from app.integrations.setu.service import (
-    CreateDataSessionRequest,
     CreateConsentRequest,
+    CreateDataSessionRequest,
     create_data_session,
     fetch_data_session_summary,
+    get_fi_fetch_status,
+    request_fi_data_fetch,
     refresh_consent_status,
 )
-from app.integrations.setu.exceptions import SetuMalformedResponseError
 from app.models import ConsentRecord
-from app.routes.setu import fetch_data_session, request_consent, request_data_session
+from app.routes.setu import (
+    fetch_data_session,
+    request_consent,
+    request_data_session,
+    request_fi_fetch,
+)
 
 
 def request_body(connection_id):
@@ -119,6 +125,7 @@ class TestSetuConsent(unittest.TestCase):
         sent_payload = client.request.call_args.kwargs["json"]
         self.assertEqual(sent_payload["consentDuration"], {"unit": "MONTH", "value": 1})
         self.assertEqual(sent_payload["vua"], "1234567890@onemoney")
+        self.assertEqual(client.request.call_args.args, ("POST", "/v2/consents"))
 
     def test_rejects_non_sandbox_connection_before_provider_call(self):
         session = FakeSession()
@@ -508,9 +515,11 @@ class TestSetuConsent(unittest.TestCase):
 
     def test_fetch_route_requires_fresh_active_consent(self):
         session = FakeSession()
-        client = mock_setu_client(
-            {"id": "consent-123", "status": "PENDING"}
-        )
+        client = mock_setu_client({})
+        client.request.side_effect = [
+            {"id": "consent-123", "status": "ACTIVE"},
+            {"status": "PENDING", "consentId": "consent-123"},
+        ]
         with (
             patch("app.routes.setu.SetuSettings", return_value=self._settings()),
             patch("app.routes.setu.SetuClient", return_value=client),
@@ -519,13 +528,18 @@ class TestSetuConsent(unittest.TestCase):
             fetch_data_session("consent-123", "session-456", session)
 
         self.assertEqual(raised.exception.status_code, 409)
-        self.assertEqual(client.request.call_count, 1)
+        self.assertEqual(client.request.call_count, 2)
+        self.assertEqual(
+            client.request.call_args_list[1].args,
+            ("GET", "/v2/consents/consent-123/fetch/status"),
+        )
 
     def test_fetch_route_returns_only_counts_after_active_consent(self):
         session = FakeSession()
         client = mock_setu_client({})
         client.request.side_effect = [
             {"id": "consent-123", "status": "ACTIVE"},
+            {"status": "COMPLETED", "consentId": "consent-123"},
             {
                 "id": "session-456",
                 "consentId": "consent-123",
@@ -542,11 +556,84 @@ class TestSetuConsent(unittest.TestCase):
 
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["data_account_count"], 1)
+        self.assertEqual(client.request.call_count, 3)
+        self.assertEqual(
+            client.request.call_args_list[2].args,
+            ("GET", "/v2/sessions/session-456"),
+        )
+
+    def test_explicit_fetch_trigger_calls_post_without_exposing_payload(self):
+        session = FakeSession()
+        client = mock_setu_client({})
+        client.request.side_effect = [
+            {"id": "consent-123", "status": "ACTIVE"},
+            {},
+        ]
+
+        with (
+            patch("app.routes.setu.SetuSettings", return_value=self._settings()),
+            patch("app.routes.setu.SetuClient", return_value=client),
+        ):
+            result = request_fi_fetch("consent-123", "session-456", session)
+
+        self.assertEqual(result, {"status": "fetch_requested"})
         self.assertEqual(client.request.call_count, 2)
         self.assertEqual(
             client.request.call_args_list[1].args,
-            ("GET", "/v2/sessions/session-456"),
+            ("POST", "/v2/sessions/session-456"),
         )
+        self.assertTrue(client.request.call_args_list[1].kwargs["allow_empty"])
+
+    def test_fetch_trigger_does_not_call_provider_for_pending_consent(self):
+        session = FakeSession()
+        client = mock_setu_client(
+            {"id": "consent-123", "status": "PENDING"}
+        )
+
+        with (
+            patch("app.routes.setu.SetuSettings", return_value=self._settings()),
+            patch("app.routes.setu.SetuClient", return_value=client),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            request_fi_fetch("consent-123", "session-456", session)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        client.request.assert_called_once_with("GET", "/v2/consents/consent-123")
+
+    def test_fetch_status_maps_provider_status(self):
+        record = ConsentRecord(
+            id=uuid4(),
+            connection_id=uuid4(),
+            external_consent_id="consent-123",
+            status="approved",
+        )
+        client = mock_setu_client(
+            {"status": "PARTIAL", "consentId": "consent-123"}
+        )
+
+        result = get_fi_fetch_status(client, record)
+
+        self.assertEqual(result, {"status": "partial"})
+        self.assertEqual(
+            client.request.call_args.args,
+            ("GET", "/v2/consents/consent-123/fetch/status"),
+        )
+
+    def test_fetch_status_rejects_unknown_status_and_wrong_consent(self):
+        record = ConsentRecord(
+            id=uuid4(),
+            connection_id=uuid4(),
+            external_consent_id="consent-123",
+            status="approved",
+        )
+        for response in (
+            {"status": "READY"},
+            {"status": "COMPLETED", "consentId": "other-consent"},
+        ):
+            with self.subTest(response=response):
+                client = mock_setu_client(response)
+                with self.assertRaises(SetuMalformedResponseError):
+                    get_fi_fetch_status(client, record)
 
 
 if __name__ == "__main__":

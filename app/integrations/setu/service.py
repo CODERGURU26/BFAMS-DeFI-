@@ -270,6 +270,50 @@ def create_data_session(
     }
 
 
+def request_fi_data_fetch(
+    client: SetuClient,
+    record: ConsentRecord,
+    session_id: str,
+) -> dict[str, str]:
+    if record.status != "approved":
+        raise ValueError("Setu consent must be approved before requesting data.")
+    if not record.external_consent_id or not session_id.strip():
+        raise SetuMalformedResponseError("Setu data session reference is invalid.")
+
+    client.request(
+        "POST",
+        f"/v2/sessions/{quote(session_id.strip(), safe='')}",
+        allow_empty=True,
+    )
+    return {"status": "fetch_requested"}
+
+
+def get_fi_fetch_status(
+    client: SetuClient,
+    record: ConsentRecord,
+) -> dict[str, str]:
+    if not record.external_consent_id:
+        raise SetuMalformedResponseError("Stored Setu consent reference is missing.")
+
+    response = client.request(
+        "GET",
+        f"/v2/consents/{quote(record.external_consent_id, safe='')}/fetch/status",
+    )
+    provider_status = response.get("status")
+    response_consent_id = response.get("consentId")
+    if (
+        not isinstance(provider_status, str)
+        or provider_status.upper() not in _DATA_SESSION_STATUSES
+        or (
+            response_consent_id is not None
+            and response_consent_id != record.external_consent_id
+        )
+    ):
+        raise SetuMalformedResponseError("Setu fetch status response is invalid.")
+
+    return {"status": provider_status.upper().lower()}
+
+
 _DATA_SESSION_STATUSES = {
     "PENDING",
     "PARTIAL",

@@ -12,8 +12,10 @@ from app.integrations.setu.service import (
     CreateDataSessionRequest,
     create_data_session,
     create_consent,
+    get_fi_fetch_status,
     fetch_data_session_summary,
     is_setu_sandbox_connection,
+    request_fi_data_fetch,
     refresh_consent_status,
 )
 from app.models import ConsentRecord, DataProvider, FinancialConnection, User
@@ -271,6 +273,12 @@ def fetch_data_session(
                     status_code=409,
                     detail="Setu consent is not approved.",
                 )
+            fetch_status = get_fi_fetch_status(client, record)
+            if fetch_status["status"] not in {"partial", "completed"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Setu financial data is not ready to fetch.",
+                )
             return fetch_data_session_summary(client, record, session_id)
     except ValueError as exc:
         raise HTTPException(
@@ -281,4 +289,70 @@ def fetch_data_session(
         raise HTTPException(
             status_code=502,
             detail="Setu financial data could not be retrieved.",
+        ) from exc
+
+
+@router.post("/consents/{consent_id}/sessions/{session_id}/fetch")
+def request_fi_fetch(
+    consent_id: str,
+    session_id: str,
+    session: Session = Depends(get_setu_test_db),
+) -> dict[str, str]:
+    settings = SetuSettings()
+    if settings.environment != "sandbox":
+        raise HTTPException(
+            status_code=403,
+            detail="Setu endpoints are available only in the sandbox environment.",
+        )
+    if not settings.has_credentials:
+        raise HTTPException(
+            status_code=503,
+            detail="Setu sandbox configuration is incomplete.",
+        )
+
+    consent_rows = session.execute(
+        select(ConsentRecord, FinancialConnection, DataProvider.provider_code)
+        .join(
+            FinancialConnection,
+            FinancialConnection.id == ConsentRecord.connection_id,
+        )
+        .join(DataProvider, DataProvider.id == FinancialConnection.provider_id)
+        .where(ConsentRecord.external_consent_id == consent_id)
+        .limit(2)
+    ).all()
+    if len(consent_rows) != 1:
+        raise HTTPException(status_code=404, detail="Setu consent not found.")
+
+    record, connection, provider_code = consent_rows[0]
+    user = session.get(User, connection.user_id)
+    user_connection_count = session.scalar(
+        select(func.count())
+        .select_from(FinancialConnection)
+        .where(FinancialConnection.user_id == connection.user_id)
+    )
+    if (
+        user is None
+        or user_connection_count != 1
+        or not is_setu_sandbox_connection(connection, provider_code)
+    ):
+        raise HTTPException(status_code=404, detail="Setu consent not found.")
+
+    try:
+        with SetuClient(settings) as client:
+            consent_status = refresh_consent_status(session, client, record)
+            if consent_status["status"] != "approved":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Setu consent is not approved.",
+                )
+            return request_fi_data_fetch(client, record, session_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Setu consent is not ready for a data fetch.",
+        ) from exc
+    except SetuError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Setu financial data fetch could not be requested.",
         ) from exc

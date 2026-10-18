@@ -95,6 +95,16 @@ class TestSetuClient(unittest.TestCase):
             with self.assertRaises(SetuMalformedResponseError):
                 client.request("GET", "/health")
 
+    def test_empty_success_response_is_allowed_only_when_requested(self):
+        transport = httpx.MockTransport(lambda _: httpx.Response(204))
+        with SetuClient(configured_settings(), transport=transport) as client:
+            self.assertEqual(
+                client.request("POST", "/v2/sessions/id", allow_empty=True),
+                {},
+            )
+            with self.assertRaises(SetuMalformedResponseError):
+                client.request("POST", "/v2/sessions/id")
+
     def test_rejects_absolute_url_as_path(self):
         with SetuClient(
             configured_settings(),

@@ -127,12 +127,23 @@ conflict, stop and ask rather than selecting one.
   status constraint, and only status plus a validated timezone-aware expiry
   may be persisted. The status route checks the consent's isolated Setu
   sandbox connection before contacting Setu.
-- Data session creation uses `POST /sessions` only after a fresh Get Consent
+- Data session creation uses `POST /v2/sessions` only after a fresh Get Consent
   response reports `ACTIVE`. The requested format and timezone-aware data
   range are explicit; Setu enforces that the range is within the granted
   consent. The API returns the provider session ID for the caller to retain.
   The existing schema has no session-ID field, so sessions are not persisted
   locally; durable recovery would require a separately approved schema change.
+- Consent and session API requests use Setu's versioned `/v2` paths, verified
+  against Setu's [official FIU V2 Postman collection](https://documenter.getpostman.com/view/22511424/2s9Y5VU4MC).
+  FI fetch initiation is a separate explicit `POST /v2/sessions/{id}`; it does
+  not return or persist financial data. Retrieval first checks
+  `GET /v2/consents/{consentId}/fetch/status` and is allowed only for
+  provider-reported `PARTIAL` or `COMPLETED`, then reads
+  `GET /v2/sessions/{id}`. The response is reduced to safe aggregate counts;
+  raw financial payloads are neither stored, logged, nor returned.
+- The FIU V2 Postman collection configures bearer-token authorization, while
+  the existing Setu client uses the header scheme explicitly selected earlier.
+  No live request was made; resolve this auth contract before sandbox use.
 - `DataSyncRun` has no created/updated counts or session ID. These would improve
   observability, but must not be added without schema approval.
 - `account_balances` and `investment_holdings` have no database unique

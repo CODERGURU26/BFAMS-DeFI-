@@ -63,6 +63,7 @@ class SetuClient:
         *,
         json: Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
+        allow_empty: bool = False,
     ) -> dict[str, Any]:
         if not path.startswith("/") or path.startswith("//"):
             raise SetuConfigurationError("Setu API path must be an absolute API path.")
@@ -81,6 +82,9 @@ class SetuClient:
 
         if not response.is_success:
             raise SetuAPIError(response.status_code)
+
+        if not response.content and allow_empty:
+            return {}
 
         try:
             payload = response.json()
