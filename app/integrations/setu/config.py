@@ -8,6 +8,7 @@ class SetuSettings(BaseSettings):
     client_id: SecretStr | None = None
     client_secret: SecretStr | None = None
     product_instance_id: SecretStr | None = None
+    vua: SecretStr | None = None
     environment: str = "sandbox"
     session_poll_interval_seconds: float = Field(default=1.0, gt=0)
     session_poll_max_attempts: int = Field(default=30, gt=0)
