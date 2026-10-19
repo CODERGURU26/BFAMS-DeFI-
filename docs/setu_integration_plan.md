@@ -127,14 +127,20 @@ the official Setu docs and FIU V2 Postman collection.
   requested range to be within the granted consent. The response returns the
   session ID, consent ID, format, and status to the caller. Session creation
   does not persist anything locally.
+- `GET /api/setu/sessions/{sessionId}` retrieves a session response without
+  altering it. Add `?poll=true` to poll until `PARTIAL` or `COMPLETED`; `PENDING`
+  is never returned as ready, and `EXPIRED` / `FAILED` are terminal errors.
+  Polling is bounded by `SETU_SESSION_POLL_INTERVAL_SECONDS`,
+  `SETU_SESSION_POLL_MAX_ATTEMPTS`, and `SETU_SESSION_POLL_TIMEOUT_SECONDS`.
+  The route does not persist, parse, normalize, or log the financial payload.
 - Consent and session API requests use Setu's versioned `/v2` paths, verified
   against Setu's [official FIU V2 Postman collection](https://documenter.getpostman.com/view/22511424/2s9Y5VU4MC).
   FI fetch initiation is a separate explicit `POST /v2/sessions/{id}`; it does
   not return or persist financial data. Retrieval first checks
   `GET /v2/consents/{consentId}/fetch/status` and is allowed only for
   provider-reported `PARTIAL` or `COMPLETED`, then reads
-  `GET /v2/sessions/{id}`. The response is reduced to safe aggregate counts;
-  raw financial payloads are neither stored, logged, nor returned.
+  `GET /v2/sessions/{id}`. The raw session response is returned by the
+  retrieval endpoint; it is neither stored nor logged.
 - FIU V2 API calls obtain a bearer token from
   `POST https://orgservice-prod.setu.co/v1/users/login` using the documented
   `client: bridge` header and client-credentials JSON body. Subsequent FIU
