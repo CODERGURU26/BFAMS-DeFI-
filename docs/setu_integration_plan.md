@@ -96,9 +96,7 @@ No changes to `database.py`'s existing `Settings` class are planned.
     safe statuses/counts.
 
 Consent and data-session request paths and payloads have been checked against
-the official Setu docs and FIU V2 Postman collection. The collection's bearer
-authorization still conflicts with the previously selected header scheme and
-must be resolved before any live request.
+the official Setu docs and FIU V2 Postman collection.
 
 ## Database mapping and sandbox isolation
 
@@ -124,11 +122,11 @@ must be resolved before any live request.
   provider's consent ID and status without local persistence. The consent
   reference is supplied by the caller; no local consent lookup is required.
 - Data session creation uses `POST /v2/sessions` only after a fresh Get Consent
-  response reports `ACTIVE`. The requested format and timezone-aware data
-  range are explicit; Setu enforces that the range is within the granted
-  consent. The API returns the provider session ID for the caller to retain.
-  The existing schema has no session-ID field, so sessions are not persisted
-  locally; durable recovery would require a separately approved schema change.
+  response reports `ACTIVE`. The request requires an explicit `consentId`,
+  timezone-aware `dataRange`, and `format` (`json` or `xml`); Setu requires the
+  requested range to be within the granted consent. The response returns the
+  session ID, consent ID, format, and status to the caller. Session creation
+  does not persist anything locally.
 - Consent and session API requests use Setu's versioned `/v2` paths, verified
   against Setu's [official FIU V2 Postman collection](https://documenter.getpostman.com/view/22511424/2s9Y5VU4MC).
   FI fetch initiation is a separate explicit `POST /v2/sessions/{id}`; it does

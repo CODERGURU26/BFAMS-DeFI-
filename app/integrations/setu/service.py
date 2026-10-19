@@ -1,6 +1,8 @@
 """Setu consent and financial-data service operations."""
 
 from datetime import datetime
+from math import isfinite
+from time import monotonic, sleep
 from typing import Any, Literal
 from urllib.parse import quote, urlsplit
 from uuid import UUID
@@ -12,6 +14,10 @@ from sqlalchemy.orm import Session
 
 from app.integrations.setu.client import SetuClient
 from app.integrations.setu.exceptions import SetuMalformedResponseError
+from app.integrations.setu.exceptions import (
+    SetuDataSessionPollingTimeoutError,
+    SetuDataSessionTerminalError,
+)
 from app.integrations.setu.normalizer import normalize_setu_fi_response
 from app.models import ConsentRecord, FinancialConnection
 from app.schemas import NormalizedAccount, NormalizedTransaction
@@ -74,7 +80,16 @@ class CreateDataSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     data_range: ConsentDataRange = Field(alias="dataRange")
-    format: Literal["json"] = "json"
+    format: Literal["json", "xml"]
+
+
+class DataSessionResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(min_length=1)
+    consentId: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+    format: Literal["json", "xml"]
 
 
 def is_setu_sandbox_connection(
@@ -263,46 +278,37 @@ def refresh_consent_status(
 
 def create_data_session(
     client: SetuClient,
-    record: ConsentRecord,
+    consent: ConsentResponse,
     request: CreateDataSessionRequest,
-) -> dict[str, str]:
-    if record.status != "approved":
-        raise ValueError("Setu consent must be approved before creating a session.")
-    if not record.external_consent_id:
-        raise SetuMalformedResponseError("Stored Setu consent reference is missing.")
+) -> DataSessionResponse:
+    consent_id = consent.id.strip()
+    if not consent_id:
+        raise SetuMalformedResponseError("Setu consent reference is missing.")
+    if consent.status.upper() != "ACTIVE":
+        raise ValueError("Setu consent must be active before creating a session.")
 
     response = client.request(
         "POST",
         "/v2/sessions",
         json={
-            "consentId": record.external_consent_id,
+            "consentId": consent_id,
             "dataRange": request.data_range.model_dump(
                 by_alias=True, mode="json"
             ),
             "format": request.format,
         },
     )
-    session_id = response.get("id")
-    consent_id = response.get("consentId")
-    session_status = response.get("status")
-    response_format = response.get("format")
-    if (
-        not isinstance(session_id, str)
-        or not session_id.strip()
-        or consent_id != record.external_consent_id
-        or not isinstance(session_status, str)
-        or session_status.upper() != "PENDING"
-        or response_format != request.format
-    ):
+    try:
+        session = DataSessionResponse.model_validate(response)
+    except ValueError as exc:
+        raise SetuMalformedResponseError(
+            "Setu data session response is invalid."
+        ) from exc
+    if session.consentId != consent_id or session.format != request.format:
         raise SetuMalformedResponseError(
             "Setu data session response is invalid."
         )
-
-    return {
-        "session_id": session_id.strip(),
-        "consent_id": record.external_consent_id,
-        "status": "pending",
-    }
+    return session
 
 
 def request_fi_data_fetch(
@@ -356,6 +362,73 @@ _DATA_SESSION_STATUSES = {
     "EXPIRED",
     "FAILED",
 }
+
+
+def retrieve_data_session(
+    client: SetuClient,
+    session_id: str,
+) -> dict[str, Any]:
+    session_id = session_id.strip()
+    if not session_id:
+        raise SetuMalformedResponseError("Setu data session ID must not be empty.")
+
+    response = client.request(
+        "GET",
+        f"/v2/sessions/{quote(session_id, safe='')}",
+    )
+    response_id = response.get("id")
+    status = response.get("status")
+    if (
+        response_id != session_id
+        or not isinstance(status, str)
+        or status.upper() not in _DATA_SESSION_STATUSES
+    ):
+        raise SetuMalformedResponseError("Setu data session response is invalid.")
+    return response
+
+
+def poll_data_session(
+    client: SetuClient,
+    session_id: str,
+    *,
+    interval_seconds: float = 1.0,
+    max_attempts: int = 30,
+    timeout_seconds: float = 30.0,
+    _sleep=sleep,
+    _monotonic=monotonic,
+) -> dict[str, Any]:
+    if (
+        not isinstance(max_attempts, int)
+        or isinstance(max_attempts, bool)
+        or max_attempts <= 0
+        or not isfinite(interval_seconds)
+        or interval_seconds <= 0
+        or not isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise ValueError("Setu session polling bounds must be positive.")
+
+    deadline = _monotonic() + timeout_seconds
+    for attempt in range(max_attempts):
+        response = retrieve_data_session(client, session_id)
+        if _monotonic() >= deadline:
+            break
+        status = response["status"].upper()
+        if status in {"PARTIAL", "COMPLETED"}:
+            return response
+        if status in {"EXPIRED", "FAILED"}:
+            raise SetuDataSessionTerminalError(status)
+        if attempt == max_attempts - 1:
+            break
+
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            break
+        _sleep(min(interval_seconds, remaining))
+        if _monotonic() >= deadline:
+            break
+
+    raise SetuDataSessionPollingTimeoutError()
 
 
 def fetch_data_session_summary(

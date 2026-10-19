@@ -10,6 +10,7 @@ from app.integrations.setu.service import (
     ConsentResponse,
     CreateConsentRequest,
     CreateDataSessionRequest,
+    DataSessionResponse,
     create_data_session,
     fetch_data_session_summary,
     get_consent_status as service_get_consent_status,
@@ -331,11 +332,9 @@ class TestSetuConsent(unittest.TestCase):
         self.assertEqual(session.commit_count, 0)
 
     def test_creates_data_session_from_approved_consent(self):
-        record = ConsentRecord(
-            id=uuid4(),
-            connection_id=uuid4(),
-            external_consent_id="consent-123",
-            status="approved",
+        consent = ConsentResponse(
+            id="consent-123",
+            status="ACTIVE",
         )
         request = CreateDataSessionRequest.model_validate(
             {
@@ -352,13 +351,22 @@ class TestSetuConsent(unittest.TestCase):
                 "consentId": "consent-123",
                 "format": "json",
                 "status": "PENDING",
+                "dataRange": {
+                    "from": "2026-01-01T00:00:00Z",
+                    "to": "2026-02-01T00:00:00Z",
+                },
+                "fips": None,
+                "traceId": "trace-789",
             }
         )
 
-        result = create_data_session(client, record, request)
+        result = create_data_session(client, consent, request)
 
-        self.assertEqual(result["session_id"], "session-456")
-        self.assertEqual(result["status"], "pending")
+        self.assertIsInstance(result, DataSessionResponse)
+        self.assertEqual(result.id, "session-456")
+        self.assertEqual(result.consentId, "consent-123")
+        self.assertEqual(result.status, "PENDING")
+        self.assertEqual(result.format, "json")
         self.assertEqual(client.request.call_args.args, ("POST", "/v2/sessions"))
         self.assertEqual(
             client.request.call_args.kwargs["json"],
@@ -373,29 +381,83 @@ class TestSetuConsent(unittest.TestCase):
         )
 
     def test_does_not_create_session_for_unapproved_consent(self):
-        record = ConsentRecord(
-            id=uuid4(),
-            connection_id=uuid4(),
-            external_consent_id="consent-123",
-            status="pending",
-        )
+        consent = ConsentResponse(id="consent-123", status="PENDING")
         request = CreateDataSessionRequest.model_validate(
             {
                 "dataRange": {
                     "from": "2026-01-01T00:00:00Z",
                     "to": "2026-02-01T00:00:00Z",
-                }
+                },
+                "format": "json",
             }
         )
         client = mock_setu_client({})
 
         with self.assertRaises(ValueError):
-            create_data_session(client, record, request)
+            create_data_session(client, consent, request)
 
         client.request.assert_not_called()
 
+    def test_data_session_request_requires_explicit_format(self):
+        with self.assertRaises(ValueError):
+            CreateDataSessionRequest.model_validate(
+                {
+                    "dataRange": {
+                        "from": "2026-01-01T00:00:00Z",
+                        "to": "2026-02-01T00:00:00Z",
+                    }
+                }
+            )
+
+    def test_creates_data_session_with_xml_format(self):
+        consent = ConsentResponse(id="consent-123", status="ACTIVE")
+        request = CreateDataSessionRequest.model_validate(
+            {
+                "dataRange": {
+                    "from": "2026-01-01T00:00:00Z",
+                    "to": "2026-02-01T00:00:00Z",
+                },
+                "format": "xml",
+            }
+        )
+        client = mock_setu_client(
+            {
+                "id": "session-456",
+                "consentId": "consent-123",
+                "format": "xml",
+                "status": "PENDING",
+            }
+        )
+
+        result = create_data_session(client, consent, request)
+
+        self.assertEqual(result.format, "xml")
+        self.assertEqual(client.request.call_args.kwargs["json"]["format"], "xml")
+
+    def test_rejects_data_session_response_for_different_request(self):
+        consent = ConsentResponse(id="consent-123", status="ACTIVE")
+        request = CreateDataSessionRequest.model_validate(
+            {
+                "dataRange": {
+                    "from": "2026-01-01T00:00:00Z",
+                    "to": "2026-02-01T00:00:00Z",
+                },
+                "format": "json",
+            }
+        )
+        client = mock_setu_client(
+            {
+                "id": "session-456",
+                "consentId": "different-consent",
+                "format": "json",
+                "status": "PENDING",
+            }
+        )
+
+        with self.assertRaises(SetuMalformedResponseError):
+            create_data_session(client, consent, request)
+
     def test_session_route_refreshes_approval_before_create(self):
-        session = FakeSession()
         client = mock_setu_client({})
         client.request.side_effect = [
             {"id": "consent-123", "status": "ACTIVE"},
@@ -411,16 +473,19 @@ class TestSetuConsent(unittest.TestCase):
                 "dataRange": {
                     "from": "2026-01-01T00:00:00Z",
                     "to": "2026-02-01T00:00:00Z",
-                }
+                },
+                "format": "json",
             }
         )
         with (
             patch("app.routes.setu.SetuSettings", return_value=self._settings()),
             patch("app.routes.setu.SetuClient", return_value=client),
         ):
-            result = request_data_session("consent-123", request, session)
+            result = request_data_session("consent-123", request)
 
-        self.assertEqual(result["session_id"], "session-456")
+        self.assertEqual(result.id, "session-456")
+        self.assertEqual(result.format, "json")
+        self.assertEqual(result.status, "PENDING")
         self.assertEqual(client.request.call_count, 2)
         self.assertEqual(
             client.request.call_args_list[0].args,
@@ -430,10 +495,12 @@ class TestSetuConsent(unittest.TestCase):
             client.request.call_args_list[1].args,
             ("POST", "/v2/sessions"),
         )
-        self.assertEqual(session.record.status, "approved")
+        self.assertEqual(
+            client.request.call_args_list[1].kwargs["json"]["format"],
+            "json",
+        )
 
     def test_session_route_does_not_create_session_until_consent_active(self):
-        session = FakeSession()
         client = mock_setu_client(
             {"id": "consent-123", "status": "PENDING"}
         )
@@ -442,7 +509,8 @@ class TestSetuConsent(unittest.TestCase):
                 "dataRange": {
                     "from": "2026-01-01T00:00:00Z",
                     "to": "2026-02-01T00:00:00Z",
-                }
+                },
+                "format": "json",
             }
         )
         with (
@@ -450,7 +518,7 @@ class TestSetuConsent(unittest.TestCase):
             patch("app.routes.setu.SetuClient", return_value=client),
             self.assertRaises(HTTPException) as raised,
         ):
-            request_data_session("consent-123", request, session)
+            request_data_session("consent-123", request)
 
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(client.request.call_count, 1)

@@ -27,3 +27,15 @@ class SetuAPIError(SetuError):
 
 class SetuMalformedResponseError(SetuError):
     """Setu returned a response that is not a JSON object."""
+
+
+class SetuDataSessionPollingTimeoutError(SetuError):
+    """Setu data session did not reach a retrievable state within the polling bound."""
+
+
+class SetuDataSessionTerminalError(SetuError):
+    """Setu data session reached a terminal non-success state."""
+
+    def __init__(self, status: str):
+        self.status = status
+        super().__init__(f"Setu data session ended with status {status}.")

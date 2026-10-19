@@ -6,11 +6,16 @@ from sqlalchemy.orm import Session
 
 from app.integrations.setu.client import SetuClient
 from app.integrations.setu.config import SetuSettings
-from app.integrations.setu.exceptions import SetuError
+from app.integrations.setu.exceptions import (
+    SetuDataSessionPollingTimeoutError,
+    SetuDataSessionTerminalError,
+    SetuError,
+)
 from app.integrations.setu.service import (
     ConsentResponse,
     CreateConsentRequest,
     CreateDataSessionRequest,
+    DataSessionResponse,
     create_data_session,
     create_consent,
     get_consent_status as fetch_consent_status,
@@ -18,6 +23,8 @@ from app.integrations.setu.service import (
     fetch_data_session_summary,
     fetch_normalized_fi_data,
     is_setu_sandbox_connection,
+    poll_data_session,
+    retrieve_data_session,
     request_fi_data_fetch,
     refresh_consent_status,
 )
@@ -135,12 +142,14 @@ def get_consent_status(
         ) from exc
 
 
-@router.post("/consents/{consent_id}/sessions")
+@router.post(
+    "/consents/{consent_id}/sessions",
+    response_model=DataSessionResponse,
+)
 def request_data_session(
     consent_id: str,
     request: CreateDataSessionRequest,
-    session: Session = Depends(get_setu_test_db),
-) -> dict[str, str]:
+) -> DataSessionResponse:
     settings = SetuSettings()
     if settings.environment != "sandbox":
         raise HTTPException(
@@ -153,46 +162,69 @@ def request_data_session(
             detail="Setu sandbox configuration is incomplete.",
         )
 
-    consent_rows = session.execute(
-        select(ConsentRecord, FinancialConnection, DataProvider.provider_code)
-        .join(
-            FinancialConnection,
-            FinancialConnection.id == ConsentRecord.connection_id,
-        )
-        .join(DataProvider, DataProvider.id == FinancialConnection.provider_id)
-        .where(ConsentRecord.external_consent_id == consent_id)
-        .limit(2)
-    ).all()
-    if len(consent_rows) != 1:
-        raise HTTPException(status_code=404, detail="Setu consent not found.")
-
-    record, connection, provider_code = consent_rows[0]
-    user = session.get(User, connection.user_id)
-    user_connection_count = session.scalar(
-        select(func.count())
-        .select_from(FinancialConnection)
-        .where(FinancialConnection.user_id == connection.user_id)
-    )
-    if (
-        user is None
-        or user_connection_count != 1
-        or not is_setu_sandbox_connection(connection, provider_code)
-    ):
-        raise HTTPException(status_code=404, detail="Setu consent not found.")
-
     try:
         with SetuClient(settings) as client:
-            consent_status = refresh_consent_status(session, client, record)
-            if consent_status["status"] != "approved":
+            consent = fetch_consent_status(client, consent_id)
+            if consent.status.upper() != "ACTIVE":
                 raise HTTPException(
                     status_code=409,
                     detail="Setu consent is not approved.",
                 )
-            return create_data_session(client, record, request)
+            return create_data_session(client, consent, request)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Setu consent is not approved.",
+        ) from exc
     except SetuError as exc:
         raise HTTPException(
             status_code=502,
             detail="Setu data session could not be created.",
+        ) from exc
+
+
+@router.get("/sessions/{session_id}")
+def get_data_session(
+    session_id: str,
+    poll: bool = False,
+) -> dict:
+    settings = SetuSettings()
+    if settings.environment != "sandbox":
+        raise HTTPException(
+            status_code=403,
+            detail="Setu endpoints are available only in the sandbox environment.",
+        )
+    if not settings.has_credentials:
+        raise HTTPException(
+            status_code=503,
+            detail="Setu sandbox configuration is incomplete.",
+        )
+
+    try:
+        with SetuClient(settings) as client:
+            if not poll:
+                return retrieve_data_session(client, session_id)
+            return poll_data_session(
+                client,
+                session_id,
+                interval_seconds=settings.session_poll_interval_seconds,
+                max_attempts=settings.session_poll_max_attempts,
+                timeout_seconds=settings.session_poll_timeout_seconds,
+            )
+    except SetuDataSessionTerminalError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Setu data session reached terminal status {exc.status}.",
+        ) from exc
+    except SetuDataSessionPollingTimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="Setu data session did not become retrievable within the polling limit.",
+        ) from exc
+    except SetuError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Setu data session could not be retrieved.",
         ) from exc
 
 
