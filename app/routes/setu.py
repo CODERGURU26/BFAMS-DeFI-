@@ -10,6 +10,11 @@ from app.integrations.setu.exceptions import (
     SetuDataSessionPollingTimeoutError,
     SetuDataSessionTerminalError,
     SetuError,
+    SetuTestDatabaseError,
+)
+from app.integrations.setu.storage import (
+    SETU_SANDBOX_EXTERNAL_CONNECTION_ID,
+    store_setu_normalized_data,
 )
 from app.integrations.setu.service import (
     ConsentResponse,
@@ -21,15 +26,14 @@ from app.integrations.setu.service import (
     get_consent_status as fetch_consent_status,
     get_fi_fetch_status,
     fetch_data_session_summary,
-    fetch_normalized_fi_data,
     is_setu_sandbox_connection,
     poll_data_session,
     retrieve_data_session,
+    retrieve_normalized_fi_data,
     request_fi_data_fetch,
     refresh_consent_status,
 )
 from app.models import ConsentRecord, DataProvider, FinancialConnection, User
-from app.store import store_sync
 from database import get_test_engine
 
 router = APIRouter(prefix="/api/setu", tags=["Setu sandbox"])
@@ -266,11 +270,7 @@ def fetch_data_session(
         .select_from(FinancialConnection)
         .where(FinancialConnection.user_id == connection.user_id)
     )
-    if (
-        user is None
-        or user_connection_count != 1
-        or not is_setu_sandbox_connection(connection, provider_code)
-    ):
+    if user is None or user_connection_count != 1 or not is_setu_sandbox_connection(connection, provider_code):
         raise HTTPException(status_code=404, detail="Setu consent not found.")
 
     try:
@@ -384,20 +384,22 @@ def sync_fi_data(
             detail="Setu sandbox configuration is incomplete.",
         )
 
-    consent_rows = session.execute(
-        select(ConsentRecord, FinancialConnection, DataProvider.provider_code)
-        .join(
-            FinancialConnection,
-            FinancialConnection.id == ConsentRecord.connection_id,
-        )
+    connection_rows = session.execute(
+        select(FinancialConnection, DataProvider.provider_code)
         .join(DataProvider, DataProvider.id == FinancialConnection.provider_id)
-        .where(ConsentRecord.external_consent_id == consent_id)
+        .where(
+            FinancialConnection.external_connection_id
+            == SETU_SANDBOX_EXTERNAL_CONNECTION_ID
+        )
         .limit(2)
     ).all()
-    if len(consent_rows) != 1:
-        raise HTTPException(status_code=404, detail="Setu consent not found.")
+    if len(connection_rows) != 1:
+        raise HTTPException(
+            status_code=404,
+            detail="Dedicated Setu sandbox connection not found.",
+        )
 
-    record, connection, provider_code = consent_rows[0]
+    connection, provider_code = connection_rows[0]
     user = session.get(User, connection.user_id)
     user_connection_count = session.scalar(
         select(func.count())
@@ -407,28 +409,39 @@ def sync_fi_data(
     if (
         user is None
         or user_connection_count != 1
+        or provider_code != "setu_sandbox"
         or not is_setu_sandbox_connection(connection, provider_code)
     ):
-        raise HTTPException(status_code=404, detail="Setu consent not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Dedicated Setu sandbox connection not found.",
+        )
 
     try:
         with SetuClient(settings) as client:
-            consent_status = refresh_consent_status(session, client, record)
-            if consent_status["status"] != "approved":
+            consent = fetch_consent_status(client, consent_id)
+            if consent.status.upper() != "ACTIVE":
                 raise HTTPException(
                     status_code=409,
                     detail="Setu consent is not approved.",
                 )
-            fetch_status = get_fi_fetch_status(client, record)
-            if fetch_status["status"] not in {"partial", "completed"}:
+            data_session = retrieve_data_session(client, session_id)
+            if (
+                data_session.get("consentId") != consent_id
+                or not isinstance(data_session.get("status"), str)
+                or data_session["status"].upper() not in {"PARTIAL", "COMPLETED"}
+            ):
                 raise HTTPException(
                     status_code=409,
                     detail="Setu financial data is not ready to sync.",
                 )
-            accounts, transactions_by_account, rejected = fetch_normalized_fi_data(
-                client,
-                record,
-                session_id,
+            if data_session.get("format") != "json":
+                raise HTTPException(
+                    status_code=422,
+                    detail="Setu session format is not supported for normalization.",
+                )
+            accounts, transactions_by_account, rejected = retrieve_normalized_fi_data(
+                data_session
             )
     except ValueError as exc:
         raise HTTPException(
@@ -441,20 +454,20 @@ def sync_fi_data(
             detail="Setu financial data could not be retrieved.",
         ) from exc
 
-    if session.scalar(text("SELECT current_database()")) != "BFAMS-DeFI-test":
+    try:
+        run = store_setu_normalized_data(
+            session,
+            connection,
+            provider_code,
+            accounts,
+            transactions_by_account,
+            rejected,
+        )
+    except SetuTestDatabaseError as exc:
         raise HTTPException(
             status_code=503,
             detail="Setu sync requires the TEST database.",
-        )
-
-    run = store_sync(
-        session,
-        connection.id,
-        accounts,
-        transactions_by_account,
-        rejected,
-        sync_type="setu_aa",
-    )
+        ) from exc
     rejection_counts: dict[str, int] = {}
     for item in rejected:
         reason = item.get("reason", "invalid_record")

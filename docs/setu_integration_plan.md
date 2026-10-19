@@ -162,12 +162,16 @@ the official Setu docs and FIU V2 Postman collection.
   equity and mutual-fund holdings) are rejected as unsupported; they cannot be
   represented by the current normalized storage pipeline.
 - Explicit `POST /api/setu/consents/{consentId}/sessions/{sessionId}/sync`
-  retrieves normalized supported records only after consent and fetch status
-  are revalidated, checks `current_database()` immediately before persistence,
-  then delegates inserts and sync-run recording to `store_sync()` on the
-  `get_test_engine()` session. `store_sync()` commits internally. Existing
-  account/transaction duplicates are skipped; no existing records are updated
-  or deleted. The response contains counts and rejection reason counts only.
+  requires the setup-created `SETU-SANDBOX-1` connection, its isolated
+  `setu_sandbox` user, a fresh `ACTIVE` consent response, and a matching
+  `PARTIAL` or `COMPLETED` JSON session response. It normalizes the documented
+  session payload, checks `current_database()` immediately before persistence,
+  and delegates inserts and sync-run recording to `store_sync()` on the
+  `get_test_engine()` session. `store_sync()` commits internally; on failure it
+  rolls back the attempted account/transaction writes and records its failed
+  sync run. Existing account/transaction duplicates are skipped; no existing
+  records are updated or deleted. The response contains counts and rejection
+  reason counts only.
 - `DataSyncRun` has no created/updated counts or session ID. These would improve
   observability, but must not be added without schema approval.
 - `account_balances` and `investment_holdings` have no database unique

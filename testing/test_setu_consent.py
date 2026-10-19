@@ -64,9 +64,16 @@ class FakeSession:
             return 1
         return self.database_name
 
-    def execute(self, _statement):
+    def execute(self, statement):
         if not self.connection:
             return SimpleNamespace(first=lambda: None, all=lambda: [])
+        if statement is not None and "financial_connections.external_connection_id" in str(
+            statement.whereclause
+        ):
+            return SimpleNamespace(
+                first=lambda: (self.connection_row, "setu_sandbox"),
+                all=lambda: [(self.connection_row, "setu_sandbox")],
+            )
         return SimpleNamespace(
             first=lambda: (
                 self.connection_row,
@@ -765,7 +772,6 @@ class TestSetuConsent(unittest.TestCase):
         client = mock_setu_client({})
         client.request.side_effect = [
             {"id": "consent-123", "status": "ACTIVE"},
-            {"status": "COMPLETED", "consentId": "consent-123"},
             {
                 "id": "session-456",
                 "consentId": "consent-123",
@@ -804,7 +810,10 @@ class TestSetuConsent(unittest.TestCase):
         with (
             patch("app.routes.setu.SetuSettings", return_value=self._settings()),
             patch("app.routes.setu.SetuClient", return_value=client),
-            patch("app.routes.setu.store_sync", return_value=run) as store,
+            patch(
+                "app.integrations.setu.storage.store_sync",
+                return_value=run,
+            ) as store,
         ):
             result = sync_fi_data("consent-123", "session-456", session)
 
@@ -829,12 +838,18 @@ class TestSetuConsent(unittest.TestCase):
         client = mock_setu_client({})
         client.request.side_effect = [
             {"id": "consent-123", "status": "ACTIVE"},
-            {"status": "PENDING", "consentId": "consent-123"},
+            {
+                "id": "session-456",
+                "consentId": "consent-123",
+                "status": "PENDING",
+                "format": "json",
+                "fips": [],
+            },
         ]
         with (
             patch("app.routes.setu.SetuSettings", return_value=self._settings()),
             patch("app.routes.setu.SetuClient", return_value=client),
-            patch("app.routes.setu.store_sync") as store,
+            patch("app.integrations.setu.storage.store_sync") as store,
             self.assertRaises(HTTPException) as raised,
         ):
             sync_fi_data("consent-123", "session-456", session)
@@ -848,7 +863,6 @@ class TestSetuConsent(unittest.TestCase):
         client = mock_setu_client({})
         client.request.side_effect = [
             {"id": "consent-123", "status": "ACTIVE"},
-            {"status": "COMPLETED", "consentId": "consent-123"},
             {
                 "id": "session-456",
                 "consentId": "consent-123",
@@ -860,7 +874,7 @@ class TestSetuConsent(unittest.TestCase):
         with (
             patch("app.routes.setu.SetuSettings", return_value=self._settings()),
             patch("app.routes.setu.SetuClient", return_value=client),
-            patch("app.routes.setu.store_sync") as store,
+            patch("app.integrations.setu.storage.store_sync") as store,
             self.assertRaises(HTTPException) as raised,
         ):
             sync_fi_data("consent-123", "session-456", session)

@@ -39,3 +39,7 @@ class SetuDataSessionTerminalError(SetuError):
     def __init__(self, status: str):
         self.status = status
         super().__init__(f"Setu data session ended with status {status}.")
+
+
+class SetuTestDatabaseError(SetuError):
+    """A Setu database write was attempted outside the TEST database."""
