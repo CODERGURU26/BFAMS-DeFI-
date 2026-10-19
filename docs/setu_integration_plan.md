@@ -133,6 +133,15 @@ the official Setu docs and FIU V2 Postman collection.
   Polling is bounded by `SETU_SESSION_POLL_INTERVAL_SECONDS`,
   `SETU_SESSION_POLL_MAX_ATTEMPTS`, and `SETU_SESSION_POLL_TIMEOUT_SECONDS`.
   The route does not persist, parse, normalize, or log the financial payload.
+- The FIU session parser accepts only the documented
+  `fips[].accounts[].data.account` shape. It skips account entries whose data is
+  null or whose individual status is `FAILED`, `TIMEOUT`, or `DENIED`, allowing
+  usable accounts from a `PARTIAL` response to be processed. The separate
+  webhook `fiData[].data[].decryptedFI.account` shape is not accepted here.
+  Normalized accounts and transactions use fields available in the existing
+  schemas; holder profile names, institution names, balance, and source-update
+  timestamps are not mapped because the response fields do not unambiguously
+  match supported schema fields.
 - Consent and session API requests use Setu's versioned `/v2` paths, verified
   against Setu's [official FIU V2 Postman collection](https://documenter.getpostman.com/view/22511424/2s9Y5VU4MC).
   FI fetch initiation is a separate explicit `POST /v2/sessions/{id}`; it does

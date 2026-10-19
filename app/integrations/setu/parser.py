@@ -47,6 +47,16 @@ def parse_setu_fi_response(
                 raise SetuMalformedResponseError(
                     "Setu financial data response is invalid."
                 )
+            account_status = account_record.get(
+                "status",
+                account_record.get("FIstatus"),
+            )
+            if (
+                isinstance(account_status, str)
+                and account_status.upper() in {"FAILED", "TIMEOUT", "DENIED"}
+            ):
+                continue
+
             data = account_record.get("data")
             if data is None:
                 continue
@@ -54,14 +64,6 @@ def parse_setu_fi_response(
                 raise SetuMalformedResponseError(
                     "Setu financial data response is invalid."
                 )
-
-            decrypted = data.get("decryptedFI")
-            if decrypted is not None:
-                if not _object(decrypted):
-                    raise SetuMalformedResponseError(
-                        "Setu financial data response is invalid."
-                    )
-                data = decrypted
 
             account = data.get("account")
             if not _object(account):

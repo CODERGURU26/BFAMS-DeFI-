@@ -28,6 +28,12 @@ def account_record(
             "account": {
                 "linkedAccRef": account_id,
                 "type": account_type,
+                "profile": {
+                    "holders": {
+                        "type": "SINGLE",
+                        "holder": {"name": "Synthetic Holder"},
+                    }
+                },
                 "summary": {"status": "ACTIVE", "currency": "INR"},
                 "transactions": {"transaction": transactions or []},
             }
@@ -77,12 +83,17 @@ class TestSetuNormalizer(unittest.TestCase):
         self.assertEqual(accounts[0].account_type, "deposit")
         self.assertEqual(accounts[0].status, "active")
         self.assertEqual(accounts[0].currency, "INR")
+        self.assertIsNone(accounts[0].account_name)
+        self.assertIsNone(accounts[0].source_updated_at)
         transactions = transactions_by_account["synthetic-account"]
         self.assertEqual(
             [transaction.transaction_type for transaction in transactions],
             ["credit", "debit"],
         )
         self.assertEqual(transactions[0].amount, Decimal("123.4500"))
+        self.assertEqual(transactions[0].currency, "INR")
+        self.assertEqual(transactions[0].description, "synthetic description")
+        self.assertIsNone(transactions[0].source_updated_at)
         self.assertEqual(
             transactions[0].transaction_at,
             datetime(
@@ -95,19 +106,22 @@ class TestSetuNormalizer(unittest.TestCase):
             ),
         )
 
-    def test_normalizes_documented_decrypted_fi_variant(self):
+    def test_normalizes_official_session_response_account_shape(self):
         payload = fi_payload(
             [
                 {
                     "linkRefNumber": "stable-link-ref",
                     "data": {
-                        "decryptedFI": {
-                            "account": {
-                                "type": "deposit",
-                                "transactions": {
-                                    "transaction": [transaction_record()]
-                                },
-                            }
+                        "account": {
+                            "linkedAccRef": "stable-link-ref",
+                            "type": "deposit",
+                            "summary": {
+                                "status": "ACTIVE",
+                                "currency": "INR",
+                            },
+                            "transactions": {
+                                "transaction": [transaction_record()]
+                            },
                         }
                     },
                 }
@@ -121,6 +135,26 @@ class TestSetuNormalizer(unittest.TestCase):
         self.assertEqual(rejected, [])
         self.assertEqual(accounts[0].external_account_id, "stable-link-ref")
         self.assertEqual(len(transactions_by_account["stable-link-ref"]), 1)
+
+    def test_does_not_accept_webhook_only_decrypted_fi_shape(self):
+        payload = fi_payload(
+            [
+                {
+                    "linkRefNumber": "stable-link-ref",
+                    "data": {
+                        "decryptedFI": {
+                            "account": {
+                                "linkedAccRef": "stable-link-ref",
+                                "type": "deposit",
+                            }
+                        }
+                    },
+                }
+            ]
+        )
+
+        with self.assertRaises(SetuMalformedResponseError):
+            parse_setu_fi_response(payload)
 
     def test_rejects_unstable_ids_bad_amounts_directions_and_naive_times(self):
         payload = fi_payload(
@@ -192,6 +226,77 @@ class TestSetuNormalizer(unittest.TestCase):
             rejected,
             [{"index": 0, "reason": "unsupported_account_type"}],
         )
+
+    def test_empty_fi_response_returns_empty_normalized_results(self):
+        accounts, transactions_by_account, rejected = normalize_setu_fi_response(
+            fi_payload([])
+        )
+
+        self.assertEqual(accounts, [])
+        self.assertEqual(transactions_by_account, {})
+        self.assertEqual(rejected, [])
+
+    def test_multiple_accounts_and_partial_response_skip_failed_or_null_data(self):
+        payload = {
+            "status": "PARTIAL",
+            "format": "json",
+            "id": "synthetic-session",
+            "consentId": "synthetic-consent",
+            "fips": [
+                {
+                    "fipID": "synthetic-fip",
+                    "accounts": [
+                        account_record(
+                            account_id="account-one",
+                            transactions=[
+                                transaction_record(transaction_id="txn-one")
+                            ],
+                        ),
+                        account_record(
+                            account_id="account-two",
+                            transactions=[
+                                transaction_record(transaction_id="txn-two")
+                            ],
+                        ),
+                        {
+                            "linkRefNumber": "failed-account-ref",
+                            "status": "FAILED",
+                            "data": None,
+                        },
+                        {
+                            "linkRefNumber": "pending-account-ref",
+                            "status": "PENDING",
+                            "data": None,
+                        },
+                        {
+                            "linkRefNumber": "failed-fi-status-ref",
+                            "FIstatus": "FAILED",
+                            "data": {
+                                "account": {
+                                    "linkedAccRef": "failed-fi-status-ref",
+                                    "type": "deposit",
+                                }
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+
+        accounts, transactions_by_account, rejected = normalize_setu_fi_response(
+            payload
+        )
+
+        self.assertEqual(
+            [account.external_account_id for account in accounts],
+            ["account-one", "account-two"],
+        )
+        self.assertEqual(set(transactions_by_account), {"account-one", "account-two"})
+        self.assertEqual(
+            [len(items) for items in transactions_by_account.values()],
+            [1, 1],
+        )
+        self.assertEqual(rejected, [])
 
     def test_rejects_malformed_top_level_or_nested_shapes(self):
         for payload in (
