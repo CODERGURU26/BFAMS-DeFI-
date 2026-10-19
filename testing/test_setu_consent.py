@@ -7,10 +7,12 @@ from fastapi import HTTPException
 
 from app.integrations.setu.exceptions import SetuMalformedResponseError
 from app.integrations.setu.service import (
+    ConsentResponse,
     CreateConsentRequest,
     CreateDataSessionRequest,
     create_data_session,
     fetch_data_session_summary,
+    get_consent_status as service_get_consent_status,
     get_fi_fetch_status,
     request_fi_data_fetch,
     refresh_consent_status,
@@ -18,6 +20,7 @@ from app.integrations.setu.service import (
 from app.models import ConsentRecord
 from app.routes.setu import (
     fetch_data_session,
+    get_consent_status,
     request_consent,
     request_data_session,
     request_fi_fetch,
@@ -116,13 +119,12 @@ class TestSetuConsent(unittest.TestCase):
         ):
             result = request_consent(request_body(session.connection_id), session)
 
-        self.assertEqual(result["consent_id"], "consent-123")
-        self.assertEqual(result["status"], "pending")
-        self.assertEqual(session.commit_count, 1)
-        self.assertEqual(len(session.added), 1)
-        self.assertEqual(session.added[0].external_consent_id, "consent-123")
-        self.assertEqual(session.added[0].status, "pending")
-        self.assertFalse(hasattr(session.added[0], "vua"))
+        self.assertIsInstance(result, ConsentResponse)
+        self.assertEqual(result.id, "consent-123")
+        self.assertEqual(result.status, "PENDING")
+        self.assertEqual(result.url, "https://consent-sandbox.setu.co/approve/123")
+        self.assertEqual(session.commit_count, 0)
+        self.assertEqual(session.added, [])
         sent_payload = client.request.call_args.kwargs["json"]
         self.assertEqual(sent_payload["consentDuration"], {"unit": "MONTH", "value": 1})
         self.assertEqual(sent_payload["vua"], "1234567890@onemoney")
@@ -180,8 +182,8 @@ class TestSetuConsent(unittest.TestCase):
         self.assertEqual(session.commit_count, 0)
         self.assertEqual(session.added, [])
 
-    def test_does_not_write_when_database_is_not_test(self):
-        session = FakeSession(database_name="BFAMS-DeFI")
+    def test_consent_creation_does_not_persist_provider_response(self):
+        session = FakeSession()
         client = mock_setu_client(
             {
                 "id": "consent-123",
@@ -192,12 +194,40 @@ class TestSetuConsent(unittest.TestCase):
         with (
             patch("app.routes.setu.SetuSettings", return_value=self._settings()),
             patch("app.routes.setu.SetuClient", return_value=client),
-            self.assertRaises(RuntimeError),
         ):
-            request_consent(request_body(session.connection_id), session)
+            result = request_consent(request_body(session.connection_id), session)
 
         self.assertEqual(session.commit_count, 0)
-        self.assertEqual(session.rollback_count, 1)
+        self.assertEqual(session.added, [])
+        self.assertEqual(result.id, "consent-123")
+
+    def test_polls_consent_status_without_database_storage(self):
+        client = mock_setu_client(
+            {
+                "id": "consent-123",
+                "status": "ACTIVE",
+                "url": "https://consent-sandbox.setu.co/approve/123",
+            }
+        )
+        with (
+            patch("app.routes.setu.SetuSettings", return_value=self._settings()),
+            patch("app.routes.setu.SetuClient", return_value=client),
+        ):
+            result = get_consent_status("consent-123")
+
+        self.assertEqual(result.id, "consent-123")
+        self.assertEqual(result.status, "ACTIVE")
+        self.assertEqual(result.url, "https://consent-sandbox.setu.co/approve/123")
+        client.request.assert_called_once_with("GET", "/v2/consents/consent-123")
+
+    def test_service_status_polling_accepts_response_without_approval_url(self):
+        client = mock_setu_client({"id": "consent-123", "status": "REJECTED"})
+
+        result = service_get_consent_status(client, "consent-123")
+
+        self.assertEqual(result.id, "consent-123")
+        self.assertEqual(result.status, "REJECTED")
+        self.assertIsNone(result.url)
 
     def test_requires_timezone_aware_data_range(self):
         body = {

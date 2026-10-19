@@ -1,4 +1,4 @@
-"""Setu consent creation and persistence."""
+"""Setu consent and financial-data service operations."""
 
 from datetime import datetime
 from typing import Any, Literal
@@ -64,6 +64,12 @@ class CreateConsentRequest(BaseModel):
         return value
 
 
+class ConsentResponse(BaseModel):
+    id: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+    url: str | None = None
+
+
 class CreateDataSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -87,10 +93,9 @@ def _verify_test_database(session: Session) -> None:
 
 
 def create_consent(
-    session: Session,
     client: SetuClient,
     request: CreateConsentRequest,
-) -> dict[str, str]:
+) -> ConsentResponse:
     payload = {
         "consentDuration": request.consent_duration.model_dump(),
         "vua": request.vua.get_secret_value(),
@@ -101,22 +106,20 @@ def create_consent(
         )
 
     response = client.request("POST", "/v2/consents", json=payload)
-    consent_id = response.get("id")
-    approval_url = response.get("url")
-    status = response.get("status")
     if (
-        not isinstance(consent_id, str)
-        or not consent_id.strip()
-        or not isinstance(approval_url, str)
-        or not isinstance(status, str)
-        or status.upper() != "PENDING"
+        not isinstance(response.get("id"), str)
+        or not response["id"].strip()
+        or not isinstance(response.get("url"), str)
+        or not isinstance(response.get("status"), str)
+        or response["status"].upper() != "PENDING"
     ):
         raise SetuMalformedResponseError(
             "Setu consent response is missing a valid pending consent."
         )
 
-    consent_id = consent_id.strip()
-    approval_url = approval_url.strip()
+    consent_id = response["id"].strip()
+    approval_url = response["url"].strip()
+    status = response["status"].strip()
     parsed_url = urlsplit(approval_url)
     if (
         parsed_url.scheme != "https"
@@ -132,31 +135,61 @@ def create_consent(
             "Setu consent response contains an invalid approval URL."
         )
 
-    existing = session.scalars(
-        select(ConsentRecord).where(
-            ConsentRecord.connection_id == request.connection_id,
-            ConsentRecord.external_consent_id == consent_id,
-        )
-    ).first()
-    if existing is None:
-        record = ConsentRecord(
-            connection_id=request.connection_id,
-            external_consent_id=consent_id,
-            status="pending",
-        )
-        session.add(record)
-        try:
-            _verify_test_database(session)
-            session.commit()
-        except (SQLAlchemyError, RuntimeError):
-            session.rollback()
-            raise
+    return ConsentResponse(id=consent_id, status=status, url=approval_url)
 
-    return {
-        "consent_id": consent_id,
-        "approval_url": approval_url,
-        "status": "pending",
-    }
+
+def get_consent_status(
+    client: SetuClient,
+    consent_id: str,
+) -> ConsentResponse:
+    consent_id = consent_id.strip()
+    if not consent_id:
+        raise SetuMalformedResponseError("Setu consent ID must not be empty.")
+
+    response = client.request(
+        "GET",
+        f"/v2/consents/{quote(consent_id, safe='')}",
+    )
+    provider_id = response.get("id")
+    provider_status = response.get("status")
+    approval_url = response.get("url")
+    if (
+        not isinstance(provider_id, str)
+        or provider_id != consent_id
+        or not isinstance(provider_status, str)
+        or provider_status.upper() not in _CONSENT_STATUS_MAP
+        or (
+            approval_url is not None
+            and (
+                not isinstance(approval_url, str)
+                or not approval_url.strip()
+            )
+        )
+    ):
+        raise SetuMalformedResponseError(
+            "Setu consent status response is invalid."
+        )
+    if isinstance(approval_url, str):
+        parsed_url = urlsplit(approval_url)
+        if (
+            parsed_url.scheme != "https"
+            or not parsed_url.hostname
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or not (
+                parsed_url.hostname == "setu.co"
+                or parsed_url.hostname.endswith(".setu.co")
+            )
+        ):
+            raise SetuMalformedResponseError(
+                "Setu consent response contains an invalid approval URL."
+            )
+
+    return ConsentResponse(
+        id=provider_id,
+        status=provider_status.strip(),
+        url=approval_url,
+    )
 
 
 _CONSENT_STATUS_MAP = {

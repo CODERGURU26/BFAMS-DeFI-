@@ -110,23 +110,19 @@ must be resolved before any live request.
   provider-stable external IDs.
 - `DataSyncRun`: use existing connection, sync type, status, timestamps,
   `records_processed`, and `error_message`.
-- `consent_records`: ORM mapping matches the existing table. Consent persistence
-  was authorized for that existing table only; no DDL may be run.
-- Consent persistence is approved for the existing `consent_records` table
-  only; its ORM mapping must match the table and no DDL may be run. Consent
-  creation is restricted to a `setu_sandbox` connection with an external ID
-  beginning `SETU-SANDBOX-`. The consent endpoint accepts an explicit VUA and
-  validity duration, optionally a timezone-aware data range; it does not store
-  the VUA. Only a provider response with a valid Setu approval URL and
-  `PENDING` status may create a local pending record. Product-level consent
-  purpose, FI types, consent mode, fetch type, data life, frequency, and
-  redirect settings must be configured and verified in Setu Bridge rather
-  than silently chosen by the application.
-- Consent status polling uses the documented Get Consent API with the stored
-  Setu consent reference. Provider statuses are mapped to the existing local
-  status constraint, and only status plus a validated timezone-aware expiry
-  may be persisted. The status route checks the consent's isolated Setu
-  sandbox connection before contacting Setu.
+- `consent_records` has an ORM mapping for the existing table, but the current
+  consent creation and polling endpoints do not store or update consent rows.
+  Consent creation is restricted to a `setu_sandbox` connection with an
+  external ID beginning `SETU-SANDBOX-`. The request accepts an explicit VUA
+  and validity duration, optionally a timezone-aware data range; the VUA is
+  sent to Setu but not stored. Creation returns the provider's consent ID,
+  status, and validated HTTPS Setu approval URL. Product-level consent purpose,
+  FI types, consent mode, fetch type, data life, frequency, and redirect
+  settings must be configured and verified in Setu Bridge rather than
+  silently chosen by the application.
+- Consent status polling calls the documented Get Consent API and returns the
+  provider's consent ID and status without local persistence. The consent
+  reference is supplied by the caller; no local consent lookup is required.
 - Data session creation uses `POST /v2/sessions` only after a fresh Get Consent
   response reports `ACTIVE`. The requested format and timezone-aware data
   range are explicit; Setu enforces that the range is within the granted
@@ -141,9 +137,13 @@ must be resolved before any live request.
   provider-reported `PARTIAL` or `COMPLETED`, then reads
   `GET /v2/sessions/{id}`. The response is reduced to safe aggregate counts;
   raw financial payloads are neither stored, logged, nor returned.
-- The FIU V2 Postman collection configures bearer-token authorization, while
-  the existing Setu client uses the header scheme explicitly selected earlier.
-  No live request was made; resolve this auth contract before sandbox use.
+- FIU V2 API calls obtain a bearer token from
+  `POST https://orgservice-prod.setu.co/v1/users/login` using the documented
+  `client: bridge` header and client-credentials JSON body. Subsequent FIU
+  requests use `Authorization: Bearer` and `x-product-instance-id`; `GET
+  /v2/fips` is a route-specific exception using `x-client-id` and
+  `x-client-secret`. Token expiry is unspecified by the reviewed official
+  sources, so no TTL is assumed.
 - FI data normalization currently accepts stable deposit-account references
   and credit/debit transactions from JSON responses. Other FI types (including
   equity and mutual-fund holdings) are rejected as unsupported; they cannot be
@@ -195,8 +195,8 @@ must be resolved before any live request.
 - The existing data model/store supports accounts and transactions but not
   investments/holdings. The user's requested securities/equity holdings scope
   may require explicit schema approval or a later supported data-scope choice.
-- `consent_records` maps the existing consent table; consent persistence is
-  limited to that table and does not require schema changes.
+- `consent_records` maps the existing consent table; the consent creation and
+  polling endpoints do not persist consent records.
 - `scripts/setu_sandbox_setup.py` is dry-run by default. Use `--apply` only
   after explicit approval to create the sandbox provider, user, and connection.
 - Unauthenticated sandbox routes are acceptable only for local development;
