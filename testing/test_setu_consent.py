@@ -1,4 +1,6 @@
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -33,8 +35,12 @@ def request_body(connection_id):
     return CreateConsentRequest.model_validate(
         {
             "connection_id": str(connection_id),
-            "vua": "1234567890@onemoney",
-            "consentDuration": {"unit": "MONTH", "value": 1},
+            "vua": "test-vua-secret@setu",
+            "consentDuration": {"unit": "DAY", "value": 30},
+            "dataRange": {
+                "from": "2026-01-01T00:00:00+05:30",
+                "to": "2026-10-19T23:59:59+05:30",
+            },
         }
     )
 
@@ -121,11 +127,17 @@ class TestSetuConsent(unittest.TestCase):
                 "status": "PENDING",
             }
         )
+        captured_output = StringIO()
         with (
             patch("app.routes.setu.SetuSettings", return_value=self._settings()),
             patch("app.routes.setu.SetuClient", return_value=client),
+            redirect_stdout(captured_output),
+            redirect_stderr(captured_output),
         ):
-            result = request_consent(request_body(session.connection_id), session)
+            result = request_consent(
+                request_body(session.connection_id),
+                session,
+            )
 
         self.assertIsInstance(result, ConsentResponse)
         self.assertEqual(result.id, "consent-123")
@@ -134,9 +146,20 @@ class TestSetuConsent(unittest.TestCase):
         self.assertEqual(session.commit_count, 0)
         self.assertEqual(session.added, [])
         sent_payload = client.request.call_args.kwargs["json"]
-        self.assertEqual(sent_payload["consentDuration"], {"unit": "MONTH", "value": 1})
-        self.assertEqual(sent_payload["vua"], "1234567890@onemoney")
-        self.assertEqual(client.request.call_args.args, ("POST", "/v2/consents"))
+        self.assertEqual(
+            sent_payload["consentDuration"],
+            {"unit": "DAY", "value": "30"},
+        )
+        self.assertTrue(sent_payload["vua"])
+        self.assertEqual(
+            sent_payload["dataRange"],
+            {
+                "from": "2026-01-01T00:00:00+05:30",
+                "to": "2026-10-19T23:59:59+05:30",
+            },
+        )
+        self.assertEqual(client.request.call_args.args, ("POST", "/consents"))
+        self.assertNotIn("test-vua-secret@setu", captured_output.getvalue())
 
     def test_rejects_non_sandbox_connection_before_provider_call(self):
         session = FakeSession()

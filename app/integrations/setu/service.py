@@ -112,7 +112,10 @@ def create_consent(
     request: CreateConsentRequest,
 ) -> ConsentResponse:
     payload = {
-        "consentDuration": request.consent_duration.model_dump(),
+        "consentDuration": {
+            "unit": request.consent_duration.unit,
+            "value": str(request.consent_duration.value),
+        },
         "vua": request.vua.get_secret_value(),
     }
     if request.data_range is not None:
@@ -120,7 +123,7 @@ def create_consent(
             by_alias=True, mode="json"
         )
 
-    response = client.request("POST", "/v2/consents", json=payload)
+    response = client.request("POST", "/consents", json=payload)
     if (
         not isinstance(response.get("id"), str)
         or not response["id"].strip()
