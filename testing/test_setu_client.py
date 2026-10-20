@@ -1,4 +1,6 @@
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 
 import httpx
 from pydantic import SecretStr
@@ -7,6 +9,7 @@ from app.integrations.setu.client import (
     SETU_SANDBOX_BASE_URL,
     SETU_TOKEN_URL,
     SetuClient,
+    safe_configuration_diagnostics,
 )
 from app.integrations.setu.config import SetuSettings
 from app.integrations.setu.exceptions import (
@@ -41,8 +44,49 @@ def mock_transport(api_handler, *, token_response=None):
 
 
 class TestSetuClient(unittest.TestCase):
+    def test_safe_configuration_diagnostics_never_include_secret_values(self):
+        settings = configured_settings(vua="private-vua@setu")
+
+        diagnostics = safe_configuration_diagnostics(settings)
+
+        self.assertTrue(diagnostics["sandbox_environment"])
+        self.assertEqual(
+            diagnostics["expected_sandbox_base_url"],
+            "https://fiu-sandbox.setu.co",
+        )
+        self.assertTrue(diagnostics["sandbox_base_url_is_expected"])
+        self.assertEqual(diagnostics["create_consent_method"], "POST")
+        self.assertEqual(diagnostics["create_consent_path"], "/consents")
+        self.assertEqual(
+            diagnostics["create_consent_header_names"],
+            (
+                "x-client_id",
+                "x-client-secret",
+                "x-product-instance-id",
+                "Content-Type",
+            ),
+        )
+        self.assertEqual(
+            diagnostics["settings_present_nonblank"],
+            {
+                "SETU_CLIENT_ID": True,
+                "SETU_CLIENT_SECRET": True,
+                "SETU_PRODUCT_INSTANCE_ID": True,
+                "SETU_VUA": True,
+            },
+        )
+        serialized = repr(diagnostics)
+        for secret in (
+            "test-client-id",
+            "test-client-secret",
+            "test-product-id",
+            "private-vua@setu",
+        ):
+            self.assertNotIn(secret, serialized)
+
     def test_create_consent_uses_aa_sandbox_credential_headers(self):
         requests = []
+        captured_output = StringIO()
 
         def handler(request):
             requests.append(request)
@@ -51,7 +95,7 @@ class TestSetuClient(unittest.TestCase):
                 str(request.url),
                 f"{SETU_SANDBOX_BASE_URL}/consents",
             )
-            self.assertEqual(request.headers["x-client-id"], "test-client-id")
+            self.assertEqual(request.headers["x-client_id"], "test-client-id")
             self.assertEqual(
                 request.headers["x-client-secret"],
                 "test-client-secret",
@@ -61,6 +105,7 @@ class TestSetuClient(unittest.TestCase):
                 "test-product-id",
             )
             self.assertNotIn("authorization", request.headers)
+            self.assertNotIn("x-client-id", request.headers)
             self.assertEqual(request.headers["content-type"], "application/json")
             return httpx.Response(200, json={"id": "consent-id"})
 
@@ -68,12 +113,24 @@ class TestSetuClient(unittest.TestCase):
             configured_settings(),
             transport=httpx.MockTransport(handler),
         ) as client:
-            self.assertEqual(
-                client.request("POST", "/consents", json={"vua": "private"}),
-                {"id": "consent-id"},
-            )
+            with redirect_stdout(captured_output), redirect_stderr(captured_output):
+                self.assertEqual(
+                    client.request(
+                        "POST",
+                        "/consents",
+                        json={"vua": "private-vua@setu"},
+                    ),
+                    {"id": "consent-id"},
+                )
 
         self.assertEqual(len(requests), 1)
+        for secret in (
+            "test-client-id",
+            "test-client-secret",
+            "test-product-id",
+            "private-vua@setu",
+        ):
+            self.assertNotIn(secret, captured_output.getvalue())
 
     def test_obtains_bearer_token_then_calls_fiu_api(self):
         requests = []

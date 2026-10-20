@@ -20,6 +20,39 @@ SETU_TOKEN_CLIENT_HEADER = "bridge"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
 
+def safe_configuration_diagnostics(settings: SetuSettings) -> dict[str, object]:
+    configured = {
+        "SETU_CLIENT_ID": settings.client_id,
+        "SETU_CLIENT_SECRET": settings.client_secret,
+        "SETU_PRODUCT_INSTANCE_ID": settings.product_instance_id,
+        "SETU_VUA": settings.vua,
+    }
+    return {
+        "sandbox_environment": settings.environment == "sandbox",
+        "settings_present_nonblank": {
+            name: value is not None and bool(value.get_secret_value().strip())
+            for name, value in configured.items()
+        },
+        "expected_sandbox_base_url": SETU_SANDBOX_BASE_URL,
+        "sandbox_base_url_is_expected": (
+            SETU_SANDBOX_BASE_URL == "https://fiu-sandbox.setu.co"
+        ),
+        "create_consent_method": "POST",
+        "create_consent_path": "/consents",
+        "create_consent_header_names": (
+            "x-client_id",
+            "x-client-secret",
+            "x-product-instance-id",
+            "Content-Type",
+        ),
+        "v2_bearer_header_names": (
+            "Authorization",
+            "x-product-instance-id",
+            "Content-Type",
+        ),
+    }
+
+
 class SetuClient:
     def __init__(
         self,
@@ -74,7 +107,7 @@ class SetuClient:
             }
         elif method.upper() == "POST" and path == "/consents":
             headers = {
-                "x-client-id": self._client_id,
+                "x-client_id": self._client_id,
                 "x-client-secret": self._client_secret,
                 "x-product-instance-id": self._product_instance_id,
             }
