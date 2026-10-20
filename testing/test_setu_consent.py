@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
-from app.integrations.setu.exceptions import SetuMalformedResponseError
+from app.integrations.setu.exceptions import SetuAPIError, SetuMalformedResponseError
 from app.integrations.setu.service import (
     ConsentResponse,
     CreateConsentRequest,
@@ -160,6 +160,34 @@ class TestSetuConsent(unittest.TestCase):
         )
         self.assertEqual(client.request.call_args.args, ("POST", "/consents"))
         self.assertNotIn("test-vua-secret@setu", captured_output.getvalue())
+
+    def test_create_consent_failure_preserves_safe_http_diagnostics(self):
+        session = FakeSession()
+        client = mock_setu_client({})
+        client.request.side_effect = SetuAPIError(
+            401,
+            error_code="InvalidRequest",
+            message="Invalid request body",
+            request_id="request-123",
+        )
+        with (
+            patch("app.routes.setu.SetuSettings", return_value=self._settings()),
+            patch("app.routes.setu.SetuClient", return_value=client),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            request_consent(request_body(session.connection_id), session)
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(
+            raised.exception.detail,
+            {
+                "message": "Setu consent request failed.",
+                "upstream_status": 401,
+                "error_code": "InvalidRequest",
+                "provider_message": "Invalid request body",
+                "request_id": "request-123",
+            },
+        )
 
     def test_rejects_non_sandbox_connection_before_provider_call(self):
         session = FakeSession()

@@ -9,6 +9,7 @@ from app.integrations.setu.config import SetuSettings
 from app.integrations.setu.exceptions import (
     SetuDataSessionPollingTimeoutError,
     SetuDataSessionTerminalError,
+    SetuAPIError,
     SetuError,
     SetuTestDatabaseError,
 )
@@ -113,6 +114,18 @@ def request_consent(
     try:
         with SetuClient(settings) as client:
             return create_consent(client, request)
+    except SetuAPIError as exc:
+        detail = {
+            "message": "Setu consent request failed.",
+            "upstream_status": exc.status_code,
+        }
+        if exc.error_code:
+            detail["error_code"] = exc.error_code
+        if exc.message:
+            detail["provider_message"] = exc.message
+        if exc.request_id:
+            detail["request_id"] = exc.request_id
+        raise HTTPException(status_code=502, detail=detail) from exc
     except SetuError as exc:
         raise HTTPException(
             status_code=502,

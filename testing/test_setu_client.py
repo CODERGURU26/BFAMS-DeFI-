@@ -41,6 +41,40 @@ def mock_transport(api_handler, *, token_response=None):
 
 
 class TestSetuClient(unittest.TestCase):
+    def test_create_consent_uses_aa_sandbox_credential_headers(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(
+                str(request.url),
+                f"{SETU_SANDBOX_BASE_URL}/consents",
+            )
+            self.assertEqual(request.headers["x-client-id"], "test-client-id")
+            self.assertEqual(
+                request.headers["x-client-secret"],
+                "test-client-secret",
+            )
+            self.assertEqual(
+                request.headers["x-product-instance-id"],
+                "test-product-id",
+            )
+            self.assertNotIn("authorization", request.headers)
+            self.assertEqual(request.headers["content-type"], "application/json")
+            return httpx.Response(200, json={"id": "consent-id"})
+
+        with SetuClient(
+            configured_settings(),
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            self.assertEqual(
+                client.request("POST", "/consents", json={"vua": "private"}),
+                {"id": "consent-id"},
+            )
+
+        self.assertEqual(len(requests), 1)
+
     def test_obtains_bearer_token_then_calls_fiu_api(self):
         requests = []
 
@@ -145,6 +179,24 @@ class TestSetuClient(unittest.TestCase):
                 transport=httpx.MockTransport(lambda _: None),
             )
 
+    def test_blank_credentials_are_rejected_without_network_request(self):
+        requests = []
+        settings = configured_settings(
+            client_id="  ",
+            client_secret="",
+            product_instance_id="\t",
+        )
+
+        with self.assertRaises(SetuConfigurationError):
+            SetuClient(
+                settings,
+                transport=httpx.MockTransport(
+                    lambda request: requests.append(request)
+                ),
+            )
+
+        self.assertEqual(requests, [])
+
     def test_non_sandbox_environment_is_rejected(self):
         with self.assertRaises(SetuConfigurationError):
             SetuClient(configured_settings(environment="production"))
@@ -159,6 +211,52 @@ class TestSetuClient(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 401)
         self.assertNotIn("private", str(raised.exception))
+
+    def test_401_diagnostics_keep_safe_code_and_request_id_only(self):
+        sensitive_values = (
+            "test-client-secret",
+            "issued-access-token",
+            "private-vua@setu",
+        )
+        transport = mock_transport(
+            lambda _: httpx.Response(
+                401,
+                json={
+                    "errorCode": "InvalidRequest",
+                    "errorMsg": "private-vua@setu test-client-secret",
+                    "txnid": "request-123",
+                    "details": "issued-access-token",
+                },
+            )
+        )
+        with SetuClient(configured_settings(), transport=transport) as client:
+            with self.assertRaises(SetuAPIError) as raised:
+                client.request("POST", "/consents", json={})
+
+        self.assertEqual(raised.exception.status_code, 401)
+        self.assertEqual(raised.exception.error_code, "InvalidRequest")
+        self.assertIsNone(raised.exception.message)
+        self.assertEqual(raised.exception.request_id, "request-123")
+        for value in sensitive_values:
+            self.assertNotIn(value, str(raised.exception))
+
+    def test_401_diagnostics_allow_only_known_generic_provider_message(self):
+        transport = mock_transport(
+            lambda _: httpx.Response(
+                401,
+                json={
+                    "errorCode": "InvalidRequest",
+                    "errorMsg": "Invalid request body",
+                    "traceId": "trace-456",
+                },
+            )
+        )
+        with SetuClient(configured_settings(), transport=transport) as client:
+            with self.assertRaises(SetuAPIError) as raised:
+                client.request("POST", "/consents", json={})
+
+        self.assertEqual(raised.exception.message, "Invalid request body")
+        self.assertEqual(raised.exception.request_id, "trace-456")
 
     def test_timeout_is_controlled(self):
         def handler(_):

@@ -72,6 +72,12 @@ class SetuClient:
                 "x-client-id": self._client_id,
                 "x-client-secret": self._client_secret,
             }
+        elif method.upper() == "POST" and path == "/consents":
+            headers = {
+                "x-client-id": self._client_id,
+                "x-client-secret": self._client_secret,
+                "x-product-instance-id": self._product_instance_id,
+            }
         else:
             headers = {
                 "Authorization": f"Bearer {self._get_access_token()}",
@@ -129,7 +135,44 @@ class SetuClient:
             raise SetuTransportError("Setu API request could not be completed.") from exc
 
         if not response.is_success:
-            raise SetuAPIError(response.status_code)
+            error_payload: dict[str, Any] = {}
+            try:
+                parsed_error = response.json()
+                if isinstance(parsed_error, dict):
+                    error_payload = parsed_error
+            except ValueError:
+                pass
+
+            request_id = next(
+                (
+                    response.headers.get(header)
+                    for header in (
+                        "x-request-id",
+                        "request-id",
+                        "x-correlation-id",
+                        "x-amzn-trace-id",
+                    )
+                    if response.headers.get(header)
+                ),
+                None,
+            )
+            if request_id is None:
+                request_id = error_payload.get("txnid") or error_payload.get(
+                    "traceId"
+                )
+            safe_error_code = error_payload.get("errorCode")
+            if not isinstance(safe_error_code, str):
+                safe_error_code = None
+            safe_request_id = request_id if isinstance(request_id, str) else None
+            safe_message = error_payload.get("errorMsg")
+            if not isinstance(safe_message, str):
+                safe_message = None
+            raise SetuAPIError(
+                response.status_code,
+                error_code=safe_error_code,
+                message=safe_message,
+                request_id=safe_request_id,
+            )
 
         if not response.content and allow_empty:
             return {}
