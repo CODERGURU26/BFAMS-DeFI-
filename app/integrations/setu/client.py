@@ -27,6 +27,7 @@ def safe_configuration_diagnostics(settings: SetuSettings) -> dict[str, object]:
         "SETU_PRODUCT_INSTANCE_ID": settings.product_instance_id,
         "SETU_VUA": settings.vua,
     }
+
     return {
         "sandbox_environment": settings.environment == "sandbox",
         "settings_present_nonblank": {
@@ -34,22 +35,8 @@ def safe_configuration_diagnostics(settings: SetuSettings) -> dict[str, object]:
             for name, value in configured.items()
         },
         "expected_sandbox_base_url": SETU_SANDBOX_BASE_URL,
-        "sandbox_base_url_is_expected": (
-            SETU_SANDBOX_BASE_URL == "https://fiu-sandbox.setu.co"
-        ),
         "create_consent_method": "POST",
         "create_consent_path": "/consents",
-        "create_consent_header_names": (
-            "x-client_id",
-            "x-client-secret",
-            "x-product-instance-id",
-            "Content-Type",
-        ),
-        "v2_bearer_header_names": (
-            "Authorization",
-            "x-product-instance-id",
-            "Content-Type",
-        ),
     }
 
 
@@ -65,19 +52,30 @@ class SetuClient:
             raise SetuConfigurationError(
                 "Setu API client is restricted to the sandbox environment."
             )
+
         if not settings.has_credentials:
-            raise SetuConfigurationError("Setu sandbox credentials are not configured.")
+            raise SetuConfigurationError(
+                "Setu sandbox credentials are not configured."
+            )
+
         if timeout <= 0:
-            raise SetuConfigurationError("Setu request timeout must be positive.")
+            raise SetuConfigurationError(
+                "Setu request timeout must be positive."
+            )
 
         self._client = httpx.Client(
             headers={"Content-Type": "application/json"},
             timeout=timeout,
             transport=transport,
         )
+
         self._client_id = settings.client_id.get_secret_value()
         self._client_secret = settings.client_secret.get_secret_value()
-        self._product_instance_id = settings.product_instance_id.get_secret_value()
+        self._product_instance_id = (
+            settings.product_instance_id.get_secret_value()
+        )
+
+        self._access_token: str | None = None
 
     def close(self) -> None:
         self._client.close()
@@ -97,20 +95,30 @@ class SetuClient:
         params: Mapping[str, str] | None = None,
         allow_empty: bool = False,
     ) -> dict[str, Any]:
-        if not path.startswith("/") or path.startswith("//"):
-            raise SetuConfigurationError("Setu API path must be an absolute API path.")
 
-        if method.upper() == "GET" and path == "/v2/fips":
+        if not path.startswith("/") or path.startswith("//"):
+            raise SetuConfigurationError(
+                "Setu API path must be an absolute API path."
+            )
+
+        method = method.upper()
+
+        # GET /v2/fips
+        if method == "GET" and path == "/v2/fips":
             headers = {
                 "x-client-id": self._client_id,
                 "x-client-secret": self._client_secret,
             }
-        elif method.upper() == "POST" and path == "/consents":
+
+        # POST /consents
+        elif method == "POST" and path == "/consents":
             headers = {
-                "x-client_id": self._client_id,
+                "x-client-id": self._client_id,  # FIXED
                 "x-client-secret": self._client_secret,
                 "x-product-instance-id": self._product_instance_id,
             }
+
+        # Bearer-token endpoints
         else:
             headers = {
                 "Authorization": f"Bearer {self._get_access_token()}",
@@ -127,22 +135,31 @@ class SetuClient:
         )
 
     def _get_access_token(self) -> str:
+        if self._access_token:
+            return self._access_token
+
         payload = self._send_request(
             "POST",
             SETU_TOKEN_URL,
-            headers={"client": SETU_TOKEN_CLIENT_HEADER},
+            headers={
+                "client": SETU_TOKEN_CLIENT_HEADER,
+            },
             json={
                 "clientID": self._client_id,
-                "grant_type": "client_credentials",
                 "secret": self._client_secret,
+                "grant_type": "client_credentials",
             },
         )
+
         access_token = payload.get("access_token")
+
         if not isinstance(access_token, str) or not access_token.strip():
             raise SetuMalformedResponseError(
                 "Setu token response is missing an access token."
             )
-        return access_token.strip()
+
+        self._access_token = access_token.strip()
+        return self._access_token
 
     def _send_request(
         self,
@@ -154,21 +171,34 @@ class SetuClient:
         params: Mapping[str, str] | None = None,
         allow_empty: bool = False,
     ) -> dict[str, Any]:
+
         try:
             response = self._client.request(
-                method,
-                url,
+                method=method,
+                url=url,
                 headers=headers,
                 json=json,
                 params=params,
             )
+
         except httpx.TimeoutException as exc:
-            raise SetuTimeoutError("Setu API request timed out.") from exc
+            raise SetuTimeoutError(
+                "Setu API request timed out."
+            ) from exc
+
         except httpx.RequestError as exc:
-            raise SetuTransportError("Setu API request could not be completed.") from exc
+            raise SetuTransportError(
+                "Setu API request could not be completed."
+            ) from exc
 
         if not response.is_success:
+
+            # Helpful debugging
+            print("SETU STATUS:", response.status_code)
+            print("SETU RESPONSE:", response.text)
+
             error_payload: dict[str, Any] = {}
+
             try:
                 parsed_error = response.json()
                 if isinstance(parsed_error, dict):
@@ -189,22 +219,32 @@ class SetuClient:
                 ),
                 None,
             )
+
             if request_id is None:
-                request_id = error_payload.get("txnid") or error_payload.get(
-                    "traceId"
+                request_id = (
+                    error_payload.get("txnid")
+                    or error_payload.get("traceId")
                 )
-            safe_error_code = error_payload.get("errorCode")
-            if not isinstance(safe_error_code, str):
-                safe_error_code = None
-            safe_request_id = request_id if isinstance(request_id, str) else None
-            safe_message = error_payload.get("errorMsg")
-            if not isinstance(safe_message, str):
-                safe_message = None
+
             raise SetuAPIError(
                 response.status_code,
-                error_code=safe_error_code,
-                message=safe_message,
-                request_id=safe_request_id,
+                error_code=(
+                    error_payload.get("errorCode")
+                    if isinstance(
+                        error_payload.get("errorCode"), str
+                    )
+                    else None
+                ),
+                message=(
+                    error_payload.get("errorMsg")
+                    if isinstance(
+                        error_payload.get("errorMsg"), str
+                    )
+                    else None
+                ),
+                request_id=request_id
+                if isinstance(request_id, str)
+                else None,
             )
 
         if not response.content and allow_empty:
@@ -221,4 +261,5 @@ class SetuClient:
             raise SetuMalformedResponseError(
                 "Setu API response must be a JSON object."
             )
+
         return payload
