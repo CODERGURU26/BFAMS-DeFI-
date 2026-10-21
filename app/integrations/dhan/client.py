@@ -79,6 +79,7 @@ def _safe_response_body(
     )
     safe_body = re.sub(r"\b[A-Z]{2}[A-Z0-9]{9}[0-9]\b", "[REDACTED]", safe_body)
     safe_body = re.sub(r"\b\d{10,}\b", "[REDACTED]", safe_body)
+    safe_body = re.sub(r"[\r\n\t]+", " ", safe_body)
     return safe_body[:4000]
 
 
@@ -286,6 +287,14 @@ class DhanClient:
         except httpx.TransportError as exc:
             raise DhanAPIError(operation="instrument master") from exc
 
+        _log_request_result(
+            operation="instrument master",
+            url=DHAN_INSTRUMENT_MASTER_URL,
+            status_code=response.status_code,
+            response_body=response.text,
+            headers={},
+            secrets=self._secrets,
+        )
         if response.status_code < 200 or response.status_code >= 300:
             raise DhanAPIError(
                 response.status_code,

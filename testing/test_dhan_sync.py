@@ -165,24 +165,25 @@ class TestDhanClient(unittest.TestCase):
         self.assertTrue(len(requests) == 1)
 
     def test_error_message_contains_only_status_and_fixed_phrase(self):
-        response_body = "response-secret-and-holding-data"
+        response_body = '{"errorCode":"401","errorMsg":"Invalid access token"}'
 
         def handler(request):
             return httpx.Response(401, text=response_body)
 
         with DhanClient(
-            "header-secret",
-            "token-secret",
+            "header-client-secret",
+            "access-token-secret",
             transport=httpx.MockTransport(handler),
         ) as client:
             with self.assertRaises(DhanAPIError) as raised:
                 client.get_holdings()
 
         message = str(raised.exception)
-        self.assertTrue(message == "Dhan holdings request failed (HTTP 401).")
-        self.assertTrue(response_body not in message)
-        self.assertTrue("header-secret" not in message)
-        self.assertTrue("token-secret" not in message)
+        self.assertTrue("Dhan holdings request failed (HTTP 401)." in message)
+        self.assertTrue("Invalid access token" in message)
+        self.assertTrue(raised.exception.response_body == response_body)
+        self.assertTrue("header-client-secret" not in message)
+        self.assertTrue("access-token-secret" not in message)
 
     def test_rejects_missing_credentials_and_malformed_response(self):
         with self.assertRaises(DhanConfigurationError):
@@ -217,7 +218,11 @@ class TestDhanClient(unittest.TestCase):
             "test-access-token",
             transport=httpx.MockTransport(handler),
         ) as client:
-            payload = client.get_market_quote({"NSE_EQ": [101]})
+            with self.assertLogs(
+                "app.integrations.dhan.client",
+                level="INFO",
+            ) as captured:
+                payload = client.get_market_quote({"NSE_EQ": [101]})
 
         self.assertTrue(len(requests) == 1)
         request = requests[0]
@@ -225,29 +230,41 @@ class TestDhanClient(unittest.TestCase):
         self.assertTrue(str(request.url) == DHAN_MARKET_QUOTE_URL)
         self.assertTrue(request.headers["client-id"] == "test-client")
         self.assertTrue(request.headers["access-token"] == "test-access-token")
+        self.assertTrue(request.headers["content-type"] == "application/json")
+        self.assertTrue("authorization" not in request.headers)
         self.assertTrue(json.loads(request.content) == {"NSE_EQ": [101]})
         self.assertTrue(payload["data"]["NSE_EQ"]["101"]["net_change"] == 2)
+        log_output = "\n".join(captured.output)
+        self.assertIn(DHAN_MARKET_QUOTE_URL, log_output)
+        self.assertIn("status_code=200", log_output)
+        self.assertIn("'instrument_count': 1", log_output)
+        self.assertIn("client_id_present=True", log_output)
+        self.assertIn("access_token_present=True", log_output)
+        self.assertNotIn("test-access-token", log_output)
 
     def test_market_quote_error_is_sanitized(self):
-        response_body = "account-secret-and-price-data"
+        response_body = (
+            '{"errorCode":"401","errorMsg":"Invalid token",'
+            '"accessToken":"access-token-secret","securityId":"123456789012"}'
+        )
 
         def handler(request):
             return httpx.Response(401, text=response_body)
 
         with DhanClient(
-            "header-secret",
-            "token-secret",
+            "header-client-secret",
+            "access-token-secret",
             transport=httpx.MockTransport(handler),
         ) as client:
             with self.assertRaises(DhanAPIError) as raised:
                 client.get_market_quote({"NSE_EQ": [101]})
 
-        self.assertTrue(
-            str(raised.exception)
-            == "Dhan market quote request failed (HTTP 401)."
-        )
-        self.assertTrue(response_body not in str(raised.exception))
-        self.assertTrue("token-secret" not in str(raised.exception))
+        message = str(raised.exception)
+        self.assertTrue("Dhan market quote request failed (HTTP 401)." in message)
+        self.assertTrue("Invalid token" in message)
+        self.assertTrue(raised.exception.response_body == response_body)
+        self.assertTrue("access-token-secret" not in message)
+        self.assertTrue("123456789012" not in message)
 
 
 class TestDhanHoldingPlanning(unittest.TestCase):
@@ -719,10 +736,16 @@ class TestDhanSyncRoute(unittest.TestCase):
         self.assertEqual(self.session.commit_calls, 0)
 
     def test_live_valuation_sanitizes_market_quote_401(self):
-        mock_client = FakeDhanClient(error=DhanAPIError(
-            401,
-            operation="market quote",
-        ))
+        mock_client = FakeDhanClient(
+            error=DhanAPIError(
+                401,
+                operation="market quote",
+                response_body=(
+                    '{"errorCode":"401","errorMsg":"Invalid token",'
+                    '"accessToken":"very-secret","securityId":"123456789012"}'
+                ),
+            )
+        )
         with (
             patch.object(
                 portfolio.DhanClient,
@@ -742,8 +765,12 @@ class TestDhanSyncRoute(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 502)
         self.assertEqual(
             raised.exception.detail,
-            "Dhan market quote request failed (HTTP 401).",
+            'Dhan market quote request failed (HTTP 401). Provider response: '
+            '{"errorCode": "401", "errorMsg": "Invalid token", '
+            '"accessToken": "[REDACTED]", "securityId": "[REDACTED]"}',
         )
+        self.assertNotIn("very-secret", raised.exception.detail)
+        self.assertNotIn("123456789012", raised.exception.detail)
         self.assertEqual(self.session.added, [])
         self.assertEqual(self.session.commit_calls, 0)
 
