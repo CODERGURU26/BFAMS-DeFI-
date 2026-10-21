@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import sys
 import types
@@ -12,6 +13,7 @@ import httpx
 
 from app.integrations.dhan.client import (
     DHAN_HOLDINGS_URL,
+    DHAN_MARKET_QUOTE_URL,
     DhanAPIError,
     DhanClient,
     DhanConfigurationError,
@@ -20,6 +22,10 @@ from app.integrations.dhan.holdings import (
     DhanHoldingsValidationError,
     analyze_dhan_holdings,
     build_holding_rows,
+)
+from app.integrations.dhan.valuation import (
+    DhanValuationError,
+    build_live_dhan_valuation,
 )
 from app.integrations.dhan.settings import demo_sync_enabled
 from app.models import InvestmentHolding
@@ -87,9 +93,17 @@ class FakeSession:
 
 
 class FakeDhanClient:
-    def __init__(self, payload=None, error=None):
+    def __init__(
+        self,
+        payload=None,
+        error=None,
+        quote_payload=None,
+        instrument_master="",
+    ):
         self.payload = payload or []
         self.error = error
+        self.quote_payload = quote_payload or {"data": {}}
+        self.instrument_master = instrument_master
 
     def __enter__(self):
         return self
@@ -101,6 +115,12 @@ class FakeDhanClient:
         if self.error:
             raise self.error
         return self.payload
+
+    def get_instrument_master(self):
+        return self.instrument_master
+
+    def get_market_quote(self, instruments):
+        return self.quote_payload
 
 
 class TestDhanClient(unittest.TestCase):
@@ -178,6 +198,56 @@ class TestDhanClient(unittest.TestCase):
         ) as client:
             with self.assertRaises(DhanAPIError):
                 client.get_holdings()
+
+    def test_market_quote_uses_documented_endpoint_and_headers(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {"NSE_EQ": {"101": {"last_price": 120, "net_change": 2}}},
+                },
+            )
+
+        with DhanClient(
+            "test-client",
+            "test-access-token",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            payload = client.get_market_quote({"NSE_EQ": [101]})
+
+        self.assertTrue(len(requests) == 1)
+        request = requests[0]
+        self.assertTrue(request.method == "POST")
+        self.assertTrue(str(request.url) == DHAN_MARKET_QUOTE_URL)
+        self.assertTrue(request.headers["client-id"] == "test-client")
+        self.assertTrue(request.headers["access-token"] == "test-access-token")
+        self.assertTrue(json.loads(request.content) == {"NSE_EQ": [101]})
+        self.assertTrue(payload["data"]["NSE_EQ"]["101"]["net_change"] == 2)
+
+    def test_market_quote_error_is_sanitized(self):
+        response_body = "account-secret-and-price-data"
+
+        def handler(request):
+            return httpx.Response(401, text=response_body)
+
+        with DhanClient(
+            "header-secret",
+            "token-secret",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            with self.assertRaises(DhanAPIError) as raised:
+                client.get_market_quote({"NSE_EQ": [101]})
+
+        self.assertTrue(
+            str(raised.exception)
+            == "Dhan market quote request failed (HTTP 401)."
+        )
+        self.assertTrue(response_body not in str(raised.exception))
+        self.assertTrue("token-secret" not in str(raised.exception))
 
 
 class TestDhanHoldingPlanning(unittest.TestCase):
@@ -340,6 +410,88 @@ class TestDhanHoldingPlanning(unittest.TestCase):
                 datetime(2026, 10, 21),
                 {},
             )
+
+
+class TestDhanLiveValuation(unittest.TestCase):
+    instrument_master = (
+        "EXCH_ID,SEGMENT,SECURITY_ID,ISIN\n"
+        "NSE,E,101,INE000000001\n"
+        "BSE,E,202,INE000000002\n"
+    )
+
+    def test_calculates_live_totals_from_dhan_cost_and_quote_fields(self):
+        result = build_live_dhan_valuation(
+            [
+                {
+                    "securityId": "101",
+                    "isin": "INE000000001",
+                    "totalQty": 2,
+                    "avgCostPrice": 100,
+                },
+                {
+                    "securityId": "202",
+                    "isin": "INE000000002",
+                    "totalQty": 3,
+                    "avgCostPrice": 50,
+                },
+            ],
+            self.instrument_master,
+            {
+                "data": {
+                    "NSE_EQ": {"101": {"last_price": 120, "net_change": 2}},
+                    "BSE_EQ": {"202": {"last_price": 45, "net_change": -1}},
+                }
+            },
+        )
+
+        self.assertEqual(result["holdings_count"], 2)
+        self.assertEqual(result["priced_count"], 2)
+        self.assertTrue(result["coverage_complete"])
+        self.assertEqual(result["invested_amount"], Decimal("350"))
+        self.assertEqual(result["current_value"], Decimal("375"))
+        self.assertEqual(result["overall_pnl"], Decimal("25"))
+        self.assertEqual(result["today_pnl"], Decimal("1"))
+
+    def test_incomplete_quote_coverage_withholds_market_value_and_pnl(self):
+        result = build_live_dhan_valuation(
+            [
+                {
+                    "securityId": "101",
+                    "isin": "INE000000001",
+                    "totalQty": 2,
+                    "avgCostPrice": 100,
+                },
+                {
+                    "securityId": "202",
+                    "isin": "INE000000002",
+                    "totalQty": 3,
+                    "avgCostPrice": 50,
+                },
+            ],
+            self.instrument_master,
+            {
+                "data": {
+                    "NSE_EQ": {"101": {"last_price": 120, "net_change": 2}},
+                }
+            },
+        )
+
+        self.assertFalse(result["coverage_complete"])
+        self.assertEqual(result["priced_count"], 1)
+        self.assertEqual(result["unpriced_count"], 1)
+        self.assertEqual(result["invested_amount"], Decimal("350"))
+        self.assertIsNone(result["current_value"])
+        self.assertIsNone(result["overall_pnl"])
+        self.assertIsNone(result["today_pnl"])
+
+    def test_rejects_invalid_quantity_without_echoing_value(self):
+        with self.assertRaises(DhanValuationError) as raised:
+            build_live_dhan_valuation(
+                [{"securityId": "101", "isin": "INE000000001", "totalQty": "secret"}],
+                self.instrument_master,
+                {"data": {}},
+            )
+        self.assertNotIn("secret", str(raised.exception))
 
 
 class TestDhanSyncRoute(unittest.TestCase):
@@ -506,6 +658,94 @@ class TestDhanSyncRoute(unittest.TestCase):
         self.assertTrue("token" not in response.detail.lower())
         self.assertTrue("isin" not in response.detail.lower())
         self.assertTrue("quantity" not in response.detail.lower())
+
+    def test_live_valuation_returns_aggregate_only_and_writes_nothing(self):
+        master = (
+            "EXCH_ID,SEGMENT,SECURITY_ID,ISIN\n"
+            "NSE,E,101,INE000000001\n"
+        )
+        mock_client = FakeDhanClient(
+            [
+                {
+                    "securityId": "101",
+                    "isin": "INE000000001",
+                    "totalQty": 2,
+                    "avgCostPrice": 100,
+                }
+            ],
+            quote_payload={
+                "data": {"NSE_EQ": {"101": {"last_price": 120, "net_change": 2}}}
+            },
+            instrument_master=master,
+        )
+        with (
+            patch.object(
+                portfolio.DhanClient,
+                "from_environment",
+                return_value=mock_client,
+            ),
+            patch.object(portfolio, "_verify_test_db"),
+            patch.object(portfolio, "_get_dhan_account", return_value=self.account),
+            patch.object(portfolio, "demo_sync_enabled", return_value=True),
+        ):
+            response = portfolio.get_dhan_live_valuation(
+                self._request(),
+                session=self.session,
+            )
+
+        body = response.model_dump()
+        self.assertEqual(body["holdings_count"], 1)
+        self.assertEqual(body["priced_count"], 1)
+        self.assertTrue(body["coverage_complete"])
+        self.assertEqual(body["invested_amount"], "200")
+        self.assertEqual(body["current_value"], "240")
+        self.assertEqual(body["overall_pnl"], "40")
+        self.assertEqual(body["today_pnl"], "4")
+        self.assertEqual(
+            set(body),
+            {
+                "retrieved_at",
+                "holdings_count",
+                "priced_count",
+                "unpriced_count",
+                "coverage_complete",
+                "invested_amount",
+                "current_value",
+                "overall_pnl",
+                "today_pnl",
+            },
+        )
+        self.assertEqual(self.session.added, [])
+        self.assertEqual(self.session.commit_calls, 0)
+
+    def test_live_valuation_sanitizes_market_quote_401(self):
+        mock_client = FakeDhanClient(error=DhanAPIError(
+            401,
+            operation="market quote",
+        ))
+        with (
+            patch.object(
+                portfolio.DhanClient,
+                "from_environment",
+                return_value=mock_client,
+            ),
+            patch.object(portfolio, "_verify_test_db"),
+            patch.object(portfolio, "_get_dhan_account", return_value=self.account),
+            patch.object(portfolio, "demo_sync_enabled", return_value=True),
+        ):
+            with self.assertRaises(Exception) as raised:
+                portfolio.get_dhan_live_valuation(
+                    self._request(),
+                    session=self.session,
+                )
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(
+            raised.exception.detail,
+            "Dhan market quote request failed (HTTP 401).",
+        )
+        self.assertEqual(self.session.added, [])
+        self.assertEqual(self.session.commit_calls, 0)
 
 
 class TestDhanSettings(unittest.TestCase):

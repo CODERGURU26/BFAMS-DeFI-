@@ -71,6 +71,10 @@ from app.integrations.dhan.holdings import (
     analyze_dhan_holdings,
     persist_dhan_holdings,
 )
+from app.integrations.dhan.valuation import (
+    DhanValuationError,
+    fetch_live_dhan_valuation,
+)
 from app.integrations.dhan.settings import demo_sync_enabled
 
 router = APIRouter(prefix="/portfolio", tags=["Portfolio"])
@@ -149,6 +153,18 @@ class DhanSyncResponse(BaseModel):
     without_isin: int
 
 
+class DhanLiveValuationResponse(BaseModel):
+    retrieved_at: datetime
+    holdings_count: int
+    priced_count: int
+    unpriced_count: int
+    coverage_complete: bool
+    invested_amount: Optional[str]
+    current_value: Optional[str]
+    overall_pnl: Optional[str]
+    today_pnl: Optional[str]
+
+
 # ---------------------------------------------------------------------------
 # Helper: resolve & verify account
 # ---------------------------------------------------------------------------
@@ -216,31 +232,12 @@ def _summary_to_response(summary: IngestionSummary) -> IngestionResponse:
     )
 
 
-# ---------------------------------------------------------------------------
-# POST /portfolio/dhan/sync
-# ---------------------------------------------------------------------------
-
-
-@router.post(
-    "/dhan/sync",
-    response_model=DhanSyncResponse,
-    summary="Sync Dhan holdings into the TEST database",
-    description=(
-        "Fetches only the Dhan holdings endpoint and stores a new holdings "
-        "snapshot for the configured Dhan TEST account. No trades are fetched."
-    ),
-)
-def sync_dhan_holdings(
-    request: Request,
-    dry_run: bool = Query(True, description="Fetch and validate without writing"),
-    session: Session = Depends(get_mf_db),
-) -> DhanSyncResponse:
+def _validate_local_dhan_request(request: Request) -> None:
     if not demo_sync_enabled():
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Dhan demo sync is disabled.",
         )
-
     if request.headers.getlist("x-bfams-sync") != ["1"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -249,12 +246,12 @@ def sync_dhan_holdings(
 
     host_values = request.headers.getlist("host")
     host = host_values[0] if len(host_values) == 1 else ""
-    parsed_host = None
     try:
         parsed_host = urlsplit(f"//{host}")
         host_name = (parsed_host.hostname or "").lower()
         host_port = parsed_host.port
     except ValueError:
+        parsed_host = None
         host_name = ""
         host_port = None
     if (
@@ -292,6 +289,28 @@ def sync_dhan_holdings(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Dhan demo sync origin is not allowed.",
         )
+
+
+# ---------------------------------------------------------------------------
+# POST /portfolio/dhan/sync
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/dhan/sync",
+    response_model=DhanSyncResponse,
+    summary="Sync Dhan holdings into the TEST database",
+    description=(
+        "Fetches only the Dhan holdings endpoint and stores a new holdings "
+        "snapshot for the configured Dhan TEST account. No trades are fetched."
+    ),
+)
+def sync_dhan_holdings(
+    request: Request,
+    dry_run: bool = Query(True, description="Fetch and validate without writing"),
+    session: Session = Depends(get_mf_db),
+) -> DhanSyncResponse:
+    _validate_local_dhan_request(request)
 
     _verify_test_db(session)
     account = _get_dhan_account(session)
@@ -354,6 +373,71 @@ def sync_dhan_holdings(
         ) from None
 
     return DhanSyncResponse(**result_counts)
+
+
+@router.post(
+    "/dhan/live-valuation",
+    response_model=DhanLiveValuationResponse,
+    summary="Fetch live Dhan portfolio valuation",
+    description=(
+        "Reads Dhan holdings and market quotes without writing to the database. "
+        "Totals are returned only when every positive-quantity holding has a quote."
+    ),
+)
+def get_dhan_live_valuation(
+    request: Request,
+    session: Session = Depends(get_mf_db),
+) -> DhanLiveValuationResponse:
+    _validate_local_dhan_request(request)
+    _verify_test_db(session)
+    _get_dhan_account(session)
+
+    try:
+        with DhanClient.from_environment() as client:
+            valuation = fetch_live_dhan_valuation(client)
+    except DhanConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Dhan credentials are not configured.",
+        ) from exc
+    except DhanAPIError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from None
+    except DhanValuationError:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Dhan valuation data could not be reconciled.",
+        ) from None
+
+    return DhanLiveValuationResponse(
+        retrieved_at=valuation["retrieved_at"],
+        holdings_count=valuation["holdings_count"],
+        priced_count=valuation["priced_count"],
+        unpriced_count=valuation["unpriced_count"],
+        coverage_complete=valuation["coverage_complete"],
+        invested_amount=(
+            str(valuation["invested_amount"])
+            if valuation["invested_amount"] is not None
+            else None
+        ),
+        current_value=(
+            str(valuation["current_value"])
+            if valuation["current_value"] is not None
+            else None
+        ),
+        overall_pnl=(
+            str(valuation["overall_pnl"])
+            if valuation["overall_pnl"] is not None
+            else None
+        ),
+        today_pnl=(
+            str(valuation["today_pnl"])
+            if valuation["today_pnl"] is not None
+            else None
+        ),
+    )
 
 
 def _record_failed_dhan_sync(

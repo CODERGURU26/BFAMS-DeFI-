@@ -27,6 +27,28 @@ prices and market values. Equity valuation can use the stored
 `InvestmentHolding.unit_price` as its fallback when no NSE close exists; this
 sync intentionally leaves that value NULL.
 
+## Live Dhan valuation
+
+The dashboard's **Fetch from Dhan** action calls the read-only
+`POST /portfolio/dhan/live-valuation` route. It requires the same local-only
+guards as holdings sync and verifies the TEST database, but it does not write
+holdings, prices, or audit rows.
+
+The calculation uses Dhan's documented `avgCostPrice` and `totalQty` fields
+for invested amount, then the Dhan market-feed quote endpoint's `last_price`
+and `net_change` fields for current value, overall P&L, and today's P&L. The
+official detailed instrument master is matched on security ID and ISIN to
+determine the NSE/BSE quote segment. Individual holding data is not returned
+by this route. Current value and P&L remain unavailable unless every positive-
+quantity holding has a valid quote; a partial quote set is never shown as the
+account total.
+
+The Dhan access token must be authorized for Market Quote API access in
+addition to Holdings. A market-feed HTTP 401 is surfaced with its status only;
+the provider response body and account data are not exposed. `GET /positions`
+is not used for demat valuation because it covers open positions for the day
+and may be empty when there are no open positions.
+
 The API client, response validation, and row mapping can be checked without
 network or database access with:
 
