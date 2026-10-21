@@ -2,6 +2,7 @@
 
 import re
 from collections import defaultdict
+from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -23,6 +24,8 @@ from app.models import (
     Transaction,
     User,
 )
+from app.demat_ingestion import _is_valid_isin, value_equity_holding
+from app.mf_valuation import value_investment_holding_record
 
 router = APIRouter(prefix="/testing/dashboard", tags=["Testing dashboard"])
 
@@ -33,6 +36,175 @@ def _normalize_name(value: str) -> str:
 
 def _decimal(value) -> Decimal:
     return Decimal(value) if value is not None else Decimal(0)
+
+
+def _value_holdings(session: Session, holdings: list[InvestmentHolding], as_of: date) -> list[dict]:
+    valued = []
+    for holding in holdings:
+        quantity = holding.quantity or Decimal(0)
+        identifier = holding.asset_identifier
+        if holding.asset_type == "MUTUAL_FUND":
+            result = value_investment_holding_record(
+                session,
+                holding,
+                as_of_date=as_of,
+            )
+            price = result.nav
+            price_date = result.nav_date
+            market_value = result.market_value
+            status = result.status.value
+            stale = result.is_stale
+        elif identifier and _is_valid_isin(identifier):
+            result = value_equity_holding(
+                session=session,
+                isin=identifier,
+                asset_name=holding.asset_name,
+                asset_type=holding.asset_type,
+                quantity=quantity,
+                as_of_date=as_of,
+                dhan_closing_price=holding.unit_price,
+            )
+            price = result.close_price
+            price_date = result.price_date
+            market_value = result.market_value
+            status = result.status
+            stale = result.is_stale
+        else:
+            price = holding.unit_price
+            price_date = holding.observed_at.date()
+            market_value = holding.market_value
+            status = "snapshot" if market_value is not None else "no_price"
+            stale = False
+
+        valued.append(
+            {
+                "name": holding.asset_name,
+                "identifier": holding.asset_identifier,
+                "asset_type": holding.asset_type,
+                "quantity": str(quantity),
+                "price": str(price) if price is not None else None,
+                "price_date": price_date.isoformat() if price_date else None,
+                "market_value": (
+                    str(market_value) if market_value is not None else None
+                ),
+                "status": status,
+                "stale": stale,
+            }
+        )
+    return valued
+
+
+def _portfolio_suggestions(holdings: list[dict]) -> list[dict[str, str]]:
+    valued = [
+        row for row in holdings
+        if row["market_value"] is not None and Decimal(row["market_value"]) > 0
+    ]
+    total_value = sum((Decimal(row["market_value"]) for row in valued), Decimal(0))
+    suggestions: list[dict[str, str]] = []
+    unpriced_count = sum(row["market_value"] is None for row in holdings)
+    stale_count = sum(row["stale"] for row in holdings)
+
+    if unpriced_count:
+        suggestions.append(
+            {
+                "title": "Check price coverage",
+                "detail": (
+                    f"{unpriced_count} holding(s) have no available local price or NAV. "
+                    "Portfolio value and allocation percentages are partial."
+                ),
+                "kind": "warn",
+            }
+        )
+    if stale_count:
+        suggestions.append(
+            {
+                "title": "Review stale market data",
+                "detail": (
+                    f"{stale_count} holding(s) are valued using data older than the "
+                    "configured freshness window."
+                ),
+                "kind": "warn",
+            }
+        )
+
+    if total_value > 0:
+        largest = max(valued, key=lambda row: Decimal(row["market_value"]))
+        largest_share = Decimal(largest["market_value"]) / total_value
+        if largest_share >= Decimal("0.40"):
+            suggestions.append(
+                {
+                    "title": "Single-holding concentration",
+                    "detail": (
+                        f"The largest holding represents {largest_share:.0%} of the "
+                        "priced portfolio. Consider reviewing concentration and risk "
+                        "tolerance; this is an informational prompt, not a trade signal."
+                    ),
+                    "kind": "warn",
+                }
+            )
+
+        by_type: dict[str, Decimal] = defaultdict(Decimal)
+        for row in valued:
+            by_type[row["asset_type"]] += Decimal(row["market_value"])
+        largest_type, type_value = max(by_type.items(), key=lambda pair: pair[1])
+        type_share = type_value / total_value
+        if type_share >= Decimal("0.80") and len(by_type) > 1:
+            suggestions.append(
+                {
+                    "title": "Asset-type concentration",
+                    "detail": (
+                        f"{largest_type} represents {type_share:.0%} of priced holdings. "
+                        "Review whether this allocation matches your intended "
+                        "diversification."
+                    ),
+                    "kind": "info",
+                }
+            )
+
+    if not suggestions:
+        suggestions.append(
+            {
+                "title": "No immediate data-quality flags",
+                "detail": (
+                    "This is a basic concentration and pricing check, not a full "
+                    "suitability or investment recommendation."
+                ),
+                "kind": "ok",
+            }
+        )
+    return suggestions
+
+
+def _comparable_snapshot_change(
+    previous_values: dict[str, Decimal | None],
+    current_values: dict[str, Decimal | None],
+) -> dict[str, int | str | None]:
+    comparable_ids = {
+        identifier
+        for identifier in previous_values.keys() & current_values.keys()
+        if previous_values[identifier] is not None
+        and current_values[identifier] is not None
+    }
+    previous_total = sum(
+        (previous_values[key] for key in comparable_ids),
+        Decimal(0),
+    )
+    current_total = sum(
+        (current_values[key] for key in comparable_ids),
+        Decimal(0),
+    )
+    amount = current_total - previous_total
+    return {
+        "count": len(comparable_ids),
+        "previous_value": str(previous_total),
+        "current_value": str(current_total),
+        "amount": str(amount),
+        "percentage": (
+            str(amount / previous_total * Decimal(100))
+            if previous_total
+            else None
+        ),
+    }
 
 
 def _dashboard_data(session: Session) -> dict:
@@ -96,6 +268,82 @@ def _dashboard_data(session: Session) -> dict:
         if latest_observed is not None
         else []
     )
+    current_valuation_date = date.today()
+    valued_holdings = _value_holdings(
+        session,
+        holdings,
+        current_valuation_date,
+    )
+    valued_rows = [
+        row for row in valued_holdings if row["market_value"] is not None
+    ]
+    priced_total = sum(
+        (Decimal(row["market_value"]) for row in valued_rows),
+        Decimal(0),
+    )
+    unpriced_count = len(valued_holdings) - len(valued_rows)
+
+    snapshot_dates = session.scalars(
+        select(InvestmentHolding.observed_at)
+        .where(InvestmentHolding.account_id == account.id)
+        .group_by(InvestmentHolding.observed_at)
+        .order_by(InvestmentHolding.observed_at.desc())
+        .limit(20)
+    ).all()
+    snapshot_history = []
+    snapshot_values_by_identifier: list[dict[str, Decimal | None]] = []
+    for observed_at in reversed(snapshot_dates):
+        snapshot_rows = session.scalars(
+            select(InvestmentHolding).where(
+                InvestmentHolding.account_id == account.id,
+                InvestmentHolding.observed_at == observed_at,
+            )
+        ).all()
+        history_valued = _value_holdings(
+            session,
+            snapshot_rows,
+            observed_at.date(),
+        )
+        known_total = sum(
+            (
+                Decimal(row["market_value"])
+                for row in history_valued
+                if row["market_value"] is not None
+            ),
+            Decimal(0),
+        )
+        snapshot_values_by_identifier.append(
+            {
+                row["identifier"]: (
+                    Decimal(row["market_value"])
+                    if row["market_value"] is not None
+                    else None
+                )
+                for row in history_valued
+                if row["identifier"]
+            }
+        )
+        snapshot_history.append(
+            {
+                "observed_at": observed_at.isoformat(),
+                "market_value": str(known_total),
+                "valued_count": sum(
+                    row["market_value"] is not None for row in history_valued
+                ),
+            }
+        )
+    comparable_change = {
+        "count": 0,
+        "previous_value": None,
+        "current_value": None,
+        "amount": None,
+        "percentage": None,
+    }
+    if len(snapshot_values_by_identifier) >= 2:
+        comparable_change = _comparable_snapshot_change(
+            snapshot_values_by_identifier[-2],
+            snapshot_values_by_identifier[-1],
+        )
     transactions = session.scalars(
         select(Transaction).where(Transaction.account_id == account.id)
     ).all()
@@ -228,7 +476,24 @@ def _dashboard_data(session: Session) -> dict:
             "account_type": account.account_type,
             "currency": account.currency,
             "holdings_rows": len(holdings),
-            "holdings_market_value": str(total_market_value),
+            "holdings_market_value": str(priced_total),
+            "snapshot_market_value": str(total_market_value),
+            "valuation_as_of": current_valuation_date.isoformat(),
+            "valued_count": len(valued_rows),
+            "unpriced_count": unpriced_count,
+            "stale_count": sum(row["stale"] for row in valued_holdings),
+            "valuation_coverage": (
+                str(Decimal(len(valued_rows)) / Decimal(len(holdings)))
+                if holdings
+                else "0"
+            ),
+            "valued_holdings": [
+                {key: value for key, value in row.items() if key != "identifier"}
+                for row in valued_holdings
+            ],
+            "snapshot_history": snapshot_history,
+            "comparable_change": comparable_change,
+            "suggestions": _portfolio_suggestions(valued_holdings),
             "observed_at": latest_observed.isoformat() if latest_observed else None,
             "trade_rows": len(transactions),
             "buy_rows": buys,
@@ -286,6 +551,7 @@ _DASHBOARD_HTML = """<!doctype html>
     .section{margin-top:19px}.section-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:11px}.section h2{font-size:15px;margin:0}.panel{padding:19px}.twocol{grid-template-columns:1.15fr .85fr}.statusline{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid #263149}.statusline:last-child{border:0;padding-bottom:0}
     .status-label{font-size:13px;color:#aab6c9}.pill{border-radius:99px;padding:5px 9px;font-size:11px;font-weight:700;background:#172238;color:#a9bad5}.ok{background:#13302c;color:#7be0bd}.warn{background:#392a18;color:#f4c273}.bad{background:#3b2028;color:#ff9eaa}
     .market-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.market{padding:16px}.market strong{display:block;font-size:22px;margin-bottom:5px}.market span{font-size:12px;color:#9aa8be}
+    .visual-grid{grid-template-columns:1fr 1fr}.chart{width:100%;height:auto;min-height:250px}.chart text{fill:#aab6c9;font-size:11px;font-family:inherit}.legend{display:grid;gap:8px;margin-top:12px}.legend-row{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;color:#b8c4d7}.legend-label{display:flex;align-items:center;gap:8px;min-width:0}.legend-dot{width:9px;height:9px;border-radius:50%;flex:none}.legend-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.recommendations{display:grid;gap:10px}.recommendation{padding:13px 15px;border:1px solid #34425d;border-radius:11px;background:#121a2b}.recommendation.warn{border-color:#694c2c}.recommendation.ok{border-color:#286b60}.recommendation strong{display:block;font-size:13px;margin-bottom:5px}.recommendation p{font-size:12px;color:#aab6c9;margin:0;line-height:1.5}.table-wrap.holdings table{min-width:760px}.subtle{font-size:11px;color:#7f8da6;margin:6px 0 0}
     .table-wrap{overflow:auto;border:1px solid #263149;border-radius:12px}table{border-collapse:collapse;width:100%;min-width:700px;text-align:left}th,td{padding:12px 14px;border-bottom:1px solid #253047;font-size:12px;white-space:nowrap}th{color:#8d9bb3;font-weight:650;background:#131b2b}td{color:#dce4f1}tr:last-child td{border-bottom:0}.num{text-align:right;font-variant-numeric:tabular-nums}.positive{color:#81dfbb}.negative{color:#ff9eaa}
     .foot{margin-top:20px;color:#74829a;font-size:11px}.error{color:#ff9eaa}.loading{color:#94a1b8}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
     @media(max-width:900px){.shell{padding:20px}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.twocol{grid-template-columns:1fr}}
@@ -297,6 +563,12 @@ _DASHBOARD_HTML = """<!doctype html>
   <header class="top"><div class="brand"><div class="mark">B</div><div>BFAMS <span class="tag">portfolio lab</span></div></div><nav><a href="/testing/connect">Connect institution</a><span class="env">TEST DATABASE</span></nav></header>
   <section class="intro"><div><div class="eyebrow">Local review workspace</div><h1>Portfolio data health</h1><p class="sub">Review the Dhan import, reconciliation and market-data coverage.</p></div><div><button class="button" id="sync-dhan" type="button">Sync Dhan holdings</button> <button class="button" id="refresh" type="button">↻ &nbsp;Refresh data</button><div id="sync-status" class="foot" aria-live="polite"></div></div></section>
   <section class="grid kpis" id="kpis"><div class="card"><div class="label">Latest snapshot holdings</div><div class="value loading">—</div></div><div class="card"><div class="label">Dhan trades</div><div class="value loading">—</div></div><div class="card"><div class="label">Snapshot value</div><div class="value loading">—</div></div><div class="card"><div class="label">Net flows equal snapshot</div><div class="value loading">—</div></div></section>
+  <section class="section grid visual-grid">
+    <div class="panel"><div class="section-head"><h2>Portfolio allocation</h2><span class="pill" id="valuation-coverage">Loading</span></div><p class="subtle" id="valuation-note"></p><svg id="allocation-chart" class="chart" viewBox="0 0 360 260" role="img" aria-label="Current portfolio allocation chart"></svg><div id="allocation-legend" class="legend"></div></div>
+    <div class="panel"><div class="section-head"><h2>Portfolio value over snapshots</h2><span class="pill" id="portfolio-change">Loading</span></div><p class="subtle">Valued using locally stored market prices/NAVs as of each snapshot date. Not intraday quotes.</p><svg id="history-chart" class="chart" viewBox="0 0 720 260" role="img" aria-label="Portfolio valuation trend chart"></svg><p class="subtle" id="history-note"></p></div>
+  </section>
+  <section class="section panel"><div class="section-head"><h2>Portfolio review prompts</h2><span class="pill">Informational only</span></div><div id="suggestions" class="recommendations"></div><p class="foot">These are basic price-coverage and concentration checks, not personalized investment advice or buy/sell recommendations.</p></section>
+  <section class="section panel"><div class="section-head"><h2>Latest holdings valuation</h2><span class="pill" id="valuation-as-of">Loading</span></div><div class="table-wrap holdings"><table><thead><tr><th>Holding</th><th>Type</th><th class="num">Quantity</th><th class="num">Price / NAV</th><th class="num">Market value</th><th>Price date</th><th>Status</th></tr></thead><tbody id="holdings-valuation"></tbody></table></div></section>
   <section class="section grid twocol">
     <div class="panel"><div class="section-head"><h2>Import health</h2><span class="pill" id="db-name">Loading</span></div><div id="health"></div></div>
     <div class="panel"><div class="section-head"><h2>Reference data coverage</h2><span class="pill ok">Read-only</span></div><div class="grid market-grid" id="markets"></div><p class="foot">Counts are read live from the TEST database.</p></div>
@@ -309,11 +581,19 @@ const byId = id => document.getElementById(id);
 const number = value => new Intl.NumberFormat('en-IN').format(Number(value || 0));
 const money = value => new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:2}).format(Number(value || 0));
 const qty = value => new Intl.NumberFormat('en-IN',{maximumFractionDigits:4}).format(Number(value || 0));
+const COLORS=['#68d9bd','#68a8f0','#d6a8ff','#f3c66b','#f28fa0','#7ed1e6','#ffa66b','#a2d889','#b4a7ff','#ed91d0'];
 function statusLine(label,value,kind=''){const row=document.createElement('div');row.className='statusline';const l=document.createElement('span');l.className='status-label';l.textContent=label;const v=document.createElement('span');v.className='pill '+kind;v.textContent=value;row.append(l,v);return row}
+function svgElement(name,attrs={}){const node=document.createElementNS('http://www.w3.org/2000/svg',name);for(const [key,value] of Object.entries(attrs))node.setAttribute(key,String(value));return node}
+function renderAllocation(rows,total){const chart=byId('allocation-chart'),legend=byId('allocation-legend');chart.replaceChildren();legend.replaceChildren();const priced=rows.filter(row=>row.market_value!==null&&Number(row.market_value)>0);if(!priced.length){const text=svgElement('text',{x:180,y:130,'text-anchor':'middle'});text.textContent='No local prices available';chart.append(text);return}const groupTotals=new Map();priced.forEach(row=>groupTotals.set(row.name,(groupTotals.get(row.name)||0)+Number(row.market_value)));const entries=[...groupTotals.entries()].sort((a,b)=>b[1]-a[1]);const circumference=2*Math.PI*76;let offset=0;entries.forEach(([name,value],index)=>{const share=value/total;const color=COLORS[index%COLORS.length];const circle=svgElement('circle',{cx:180,cy:120,r:76,fill:'none',stroke:color,'stroke-width':29,'stroke-dasharray':`${share*circumference} ${circumference-share*circumference}`,'stroke-dashoffset':-offset,transform:'rotate(-90 180 120)'});const title=svgElement('title');title.textContent=`${name}: ${money(value)} (${(share*100).toFixed(1)}%)`;circle.append(title);chart.append(circle);offset+=share*circumference;const line=document.createElement('div');line.className='legend-row';const label=document.createElement('span');label.className='legend-label';const dot=document.createElement('span');dot.className='legend-dot';dot.style.backgroundColor=color;const titleText=document.createElement('span');titleText.className='legend-name';titleText.textContent=name;label.append(dot,titleText);const amount=document.createElement('span');amount.textContent=`${money(value)} · ${(share*100).toFixed(1)}%`;line.append(label,amount);legend.append(line)});const center=svgElement('text',{x:180,y:116,'text-anchor':'middle',style:'font-size:13px'});center.textContent='Priced value';const value=svgElement('text',{x:180,y:139,'text-anchor':'middle',style:'font-size:15px;font-weight:700;fill:#e8edf8'});value.textContent=money(total);chart.append(center,value)}
+function renderHistory(history,comparison){const chart=byId('history-chart');chart.replaceChildren();if(!history.length){byId('history-note').textContent='No holdings snapshots yet.';byId('portfolio-change').textContent='No snapshots';return}const width=720,height=260,left=58,right=18,top=20,bottom=45,values=history.map(row=>Number(row.market_value)),min=Math.min(...values),max=Math.max(...values),range=max-min||Math.max(max*.05,1),points=history.map((row,index)=>({x:history.length===1?(left+width-right)/2:left+index*(width-left-right)/(history.length-1),y:top+(max-values[index])*(height-top-bottom)/range,row}));chart.append(svgElement('line',{x1:left,y1:height-bottom,x2:width-right,y2:height-bottom,stroke:'#34425d'}));const path=svgElement('polyline',{points:points.map(point=>`${point.x},${point.y}`).join(' '),fill:'none',stroke:'#68d9bd','stroke-width':3,'stroke-linejoin':'round','stroke-linecap':'round'});chart.append(path);points.forEach(point=>{const circle=svgElement('circle',{cx:point.x,cy:point.y,r:5,fill:'#68d9bd'});const title=svgElement('title');title.textContent=`${new Date(point.row.observed_at).toLocaleString('en-IN')}: ${money(point.row.market_value)} · ${number(point.row.valued_count)} priced`;circle.append(title);chart.append(circle)});const first=history[0],last=history[history.length-1];if(history.length>1){if(comparison&&comparison.amount!==null&&comparison.count>0){const delta=Number(comparison.amount),pct=comparison.percentage===null?null:Number(comparison.percentage);byId('portfolio-change').textContent=`Comparable change: ${delta>=0?'+':''}${money(delta)}${pct===null?'':` (${pct>=0?'+':''}${pct.toFixed(2)}%)`} · ${number(comparison.count)} holdings`;byId('portfolio-change').className='pill '+(delta>=0?'ok':'warn')}else{byId('portfolio-change').textContent='No comparable priced holdings';byId('portfolio-change').className='pill warn'}byId('history-note').textContent=`${new Date(first.observed_at).toLocaleDateString('en-IN')} → ${new Date(last.observed_at).toLocaleDateString('en-IN')} · ${history.length} snapshots. Trend totals may have different price coverage; comparable change uses only positions priced in both latest snapshots and is not investment return.`}else{byId('portfolio-change').textContent='1 snapshot';byId('portfolio-change').className='pill warn';byId('history-note').textContent='Sync again after the cooldown to build a valuation trend.'}const leftLabel=svgElement('text',{x:left,y:height-12});leftLabel.textContent=new Date(first.observed_at).toLocaleDateString('en-IN');chart.append(leftLabel);const rightLabel=svgElement('text',{x:width-right,y:height-12,'text-anchor':'end'});rightLabel.textContent=new Date(last.observed_at).toLocaleDateString('en-IN');chart.append(rightLabel)}
+function renderSuggestions(items){const container=byId('suggestions');container.replaceChildren();items.forEach(item=>{const card=document.createElement('article');card.className='recommendation '+(item.kind||'info');const title=document.createElement('strong');title.textContent=item.title;const detail=document.createElement('p');detail.textContent=item.detail;card.append(title,detail);container.append(card)})}
+function renderHoldingTable(rows){const body=byId('holdings-valuation');body.replaceChildren();rows.forEach(row=>{const tr=document.createElement('tr');[row.name,row.asset_type,qty(row.quantity),row.price===null?'—':money(row.price),row.market_value===null?'Not priced':money(row.market_value),row.price_date||'—',row.status+(row.stale?' · stale':'')].forEach((value,index)=>{const td=document.createElement('td');td.textContent=value;if(index>=2&&index<=4)td.className='num';tr.append(td)});body.append(tr)})}
 async function load(){byId('updated').textContent='Refreshing…';byId('updated').className='foot loading';try{const response=await fetch('/testing/dashboard/data',{cache:'no-store'});if(!response.ok)throw new Error('Dashboard data request failed ('+response.status+')');const data=await response.json();const d=data.dhan||{};const counts=data.counts||{};
   byId('db-name').textContent=data.database||'Unknown database';byId('sync-dhan').dataset.accountAvailable=String(Boolean(d.account_exists));byId('sync-dhan').disabled=!d.account_exists;
+  document.querySelector('#kpis .card:nth-child(3) .label').textContent='Priced market value';
   const kpiValues=[number(d.holdings_rows),number(d.trade_rows),money(d.holdings_market_value),`${number(d.quantity_matching_groups||0)} / ${number(d.matched_security_groups||0)}`];
   [...byId('kpis').children].forEach((card,i)=>{card.querySelector('.value').textContent=kpiValues[i]});
+  const coverage=Number(d.valuation_coverage||0);byId('valuation-coverage').textContent=`${number(d.valued_count)} / ${number(d.holdings_rows)} priced`;byId('valuation-note').textContent=`${number(d.unpriced_count)} holding(s) are excluded from the current estimated total. Price date: ${d.valuation_as_of||'—'}.`;byId('valuation-as-of').textContent=`As of ${d.valuation_as_of||'—'} · ${Math.round(coverage*100)}% coverage`;renderAllocation(d.valued_holdings||[],Number(d.holdings_market_value||0));renderHistory(d.snapshot_history||[],d.comparable_change);renderSuggestions(d.suggestions||[]);renderHoldingTable(d.valued_holdings||[]);
   const health=byId('health');health.replaceChildren();
   health.append(statusLine('Dhan demat account',d.account_exists?'Connected':'Not found',d.account_exists?'ok':'bad'));
   health.append(statusLine('Holdings snapshot',`${number(d.holdings_rows)} rows · ${d.observed_at?new Date(d.observed_at).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}):'No timestamp'}`,d.holdings_rows?'ok':'warn'));
@@ -327,7 +607,7 @@ async function load(){byId('updated').textContent='Refreshing…';byId('updated'
   byId('updated').textContent='Live TEST data · refreshed '+new Date().toLocaleTimeString('en-IN');byId('updated').className='foot';
  }catch(error){byId('updated').textContent=error.message;byId('updated').className='foot error'}}
 async function syncDhan(){const button=byId('sync-dhan'),status=byId('sync-status');button.disabled=true;status.textContent='Fetching dry-run counts…';status.className='foot loading';const headers={'Accept':'application/json','X-BFAMS-Sync':'1'};try{const previewResponse=await fetch('/portfolio/dhan/sync?dry_run=true',{method:'POST',headers});const preview=await previewResponse.json();if(!previewResponse.ok)throw new Error(preview.detail||'Dhan dry run failed.');const countText=`Fetched: ${number(preview.fetched)}\nTo insert: ${number(preview.to_insert)}\nSkipped zero quantity: ${number(preview.skipped_zero_qty)}\nSame quantity: ${number(preview.same_quantity)}\nDifferent quantity: ${number(preview.different_quantity)}\nNew in API: ${number(preview.new_in_api)}\nAbsent from API: ${number(preview.absent_from_api)}\nInferred from symbol only: ${number(preview.inferred_from_symbol_only)}\nWithout ISIN: ${number(preview.without_isin)}`;status.textContent=countText;if(!window.confirm(`Dhan dry-run counts (no records written):\n\n${countText}\n\nProceed with saving the holdings snapshot?`)){status.className='foot';return}status.textContent='Saving holdings snapshot…';const applyResponse=await fetch('/portfolio/dhan/sync?dry_run=false',{method:'POST',headers});const result=await applyResponse.json();if(!applyResponse.ok)throw new Error(result.detail||'Dhan holdings sync failed.');status.textContent=`Completed. ${countText}`;status.className='foot';await load()}catch(error){status.textContent=error.message;status.className='foot error'}finally{button.disabled=button.dataset.accountAvailable!=='true'}}
-byId('refresh').addEventListener('click',load);byId('sync-dhan').addEventListener('click',syncDhan);load();
+byId('refresh').addEventListener('click',load);byId('sync-dhan').addEventListener('click',syncDhan);load();window.setInterval(load,60000);
 </script>
 </body>
 </html>"""

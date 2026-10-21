@@ -516,5 +516,70 @@ class TestDhanSettings(unittest.TestCase):
             self.assertTrue(demo_sync_enabled())
 
 
+class TestDashboardPortfolioInsights(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        dependencies = types.ModuleType("app.dependencies")
+        dependencies.get_mf_db = lambda: None
+
+        with patch.dict(
+            sys.modules,
+            {"app.dependencies": dependencies},
+        ):
+            cls.dashboard = importlib.import_module(
+                "app.routes.testing_dashboard"
+            )
+
+    def test_unpriced_and_concentrated_positions_get_informational_prompts(self):
+        suggestions = self.dashboard._portfolio_suggestions(
+            [
+                {
+                    "name": "Fixture A",
+                    "asset_type": "EQUITY",
+                    "market_value": "80",
+                    "stale": False,
+                },
+                {
+                    "name": "Fixture B",
+                    "asset_type": "ETF",
+                    "market_value": "20",
+                    "stale": True,
+                },
+                {
+                    "name": "Fixture C",
+                    "asset_type": "EQUITY",
+                    "market_value": None,
+                    "stale": False,
+                },
+            ]
+        )
+        titles = {item["title"] for item in suggestions}
+        self.assertTrue("Check price coverage" in titles)
+        self.assertTrue("Review stale market data" in titles)
+        self.assertTrue("Single-holding concentration" in titles)
+        self.assertTrue(
+            all("buy" not in item["detail"].lower() for item in suggestions)
+        )
+
+    def test_snapshot_change_uses_only_common_priced_identifiers(self):
+        result = self.dashboard._comparable_snapshot_change(
+            {
+                "shared": Decimal("100"),
+                "old-only": Decimal("50"),
+                "unpriced": None,
+            },
+            {
+                "shared": Decimal("125"),
+                "new-only": Decimal("75"),
+                "unpriced": Decimal("40"),
+            },
+        )
+        self.assertTrue(result["count"] == 1)
+        self.assertTrue(result["previous_value"] == "100")
+        self.assertTrue(result["current_value"] == "125")
+        self.assertTrue(result["amount"] == "25")
+        self.assertTrue(Decimal(result["percentage"]) == Decimal("25"))
+
+
 if __name__ == "__main__":
     unittest.main()
