@@ -33,7 +33,12 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.dependencies import get_mf_db
-from app.models import FinancialAccount, InvestmentHolding
+from app.models import (
+    DataProvider,
+    FinancialAccount,
+    FinancialConnection,
+    InvestmentHolding,
+)
 from app.demat_ingestion import (
     IngestionSummary,
     RowError,
@@ -44,6 +49,15 @@ from app.demat_ingestion import (
     parse_dhan_trades_csv,
     PortfolioSummary,
     PortfolioHoldingValuation,
+)
+from app.integrations.dhan.client import (
+    DhanAPIError,
+    DhanClient,
+    DhanConfigurationError,
+)
+from app.integrations.dhan.holdings import (
+    DhanHoldingsValidationError,
+    persist_dhan_holdings,
 )
 
 router = APIRouter(prefix="/portfolio", tags=["Portfolio"])
@@ -110,6 +124,11 @@ class PortfolioValuationResponse(BaseModel):
     holdings: List[HoldingValuationRow]
 
 
+class DhanSyncResponse(BaseModel):
+    status: str
+    records_processed: int
+
+
 # ---------------------------------------------------------------------------
 # Helper: resolve & verify account
 # ---------------------------------------------------------------------------
@@ -136,6 +155,27 @@ def _verify_test_db(session: Session) -> None:
         )
 
 
+def _get_dhan_account(session: Session) -> FinancialAccount:
+    accounts = session.scalars(
+        select(FinancialAccount)
+        .join(
+            FinancialConnection,
+            FinancialConnection.id == FinancialAccount.connection_id,
+        )
+        .join(DataProvider, DataProvider.id == FinancialConnection.provider_id)
+        .where(
+            FinancialAccount.external_account_id == "DHAN-DEMAT-1",
+            DataProvider.provider_code == "dhan_manual",
+        )
+    ).all()
+    if len(accounts) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Configured Dhan TEST account is unavailable or ambiguous.",
+        )
+    return accounts[0]
+
+
 def _summary_to_response(summary: IngestionSummary) -> IngestionResponse:
     return IngestionResponse(
         mode=summary.mode,
@@ -154,6 +194,55 @@ def _summary_to_response(summary: IngestionSummary) -> IngestionResponse:
             for e in summary.errors
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /portfolio/dhan/sync
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/dhan/sync",
+    response_model=DhanSyncResponse,
+    summary="Sync Dhan holdings into the TEST database",
+    description=(
+        "Fetches only the Dhan holdings endpoint and stores a new holdings "
+        "snapshot for the configured Dhan TEST account. No trades are fetched."
+    ),
+)
+def sync_dhan_holdings(session: Session = Depends(get_mf_db)) -> DhanSyncResponse:
+    _verify_test_db(session)
+    account = _get_dhan_account(session)
+
+    try:
+        with DhanClient.from_environment() as client:
+            payload = client.get_holdings()
+    except DhanConfigurationError as exc:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Dhan credentials are not configured.",
+        ) from exc
+    except DhanAPIError as exc:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        inserted = persist_dhan_holdings(session, account, payload)
+    except DhanHoldingsValidationError as exc:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Dhan returned an invalid holdings response.",
+        ) from exc
+    except Exception:
+        session.rollback()
+        raise
+
+    return DhanSyncResponse(status="completed", records_processed=inserted)
 
 
 # ---------------------------------------------------------------------------

@@ -295,7 +295,7 @@ _DASHBOARD_HTML = """<!doctype html>
 <body>
 <main class="shell">
   <header class="top"><div class="brand"><div class="mark">B</div><div>BFAMS <span class="tag">portfolio lab</span></div></div><nav><a href="/testing/connect">Connect institution</a><span class="env">TEST DATABASE</span></nav></header>
-  <section class="intro"><div><div class="eyebrow">Local review workspace</div><h1>Portfolio data health</h1><p class="sub">Review the Dhan import, reconciliation and market-data coverage.</p></div><button class="button" id="refresh">↻ &nbsp;Refresh data</button></section>
+  <section class="intro"><div><div class="eyebrow">Local review workspace</div><h1>Portfolio data health</h1><p class="sub">Review the Dhan import, reconciliation and market-data coverage.</p></div><div><button class="button" id="sync-dhan" type="button">Sync Dhan holdings</button> <button class="button" id="refresh" type="button">↻ &nbsp;Refresh data</button><div id="sync-status" class="foot" aria-live="polite"></div></div></section>
   <section class="grid kpis" id="kpis"><div class="card"><div class="label">Latest snapshot holdings</div><div class="value loading">—</div></div><div class="card"><div class="label">Dhan trades</div><div class="value loading">—</div></div><div class="card"><div class="label">Snapshot value</div><div class="value loading">—</div></div><div class="card"><div class="label">Net flows equal snapshot</div><div class="value loading">—</div></div></section>
   <section class="section grid twocol">
     <div class="panel"><div class="section-head"><h2>Import health</h2><span class="pill" id="db-name">Loading</span></div><div id="health"></div></div>
@@ -311,7 +311,7 @@ const money = value => new Intl.NumberFormat('en-IN',{style:'currency',currency:
 const qty = value => new Intl.NumberFormat('en-IN',{maximumFractionDigits:4}).format(Number(value || 0));
 function statusLine(label,value,kind=''){const row=document.createElement('div');row.className='statusline';const l=document.createElement('span');l.className='status-label';l.textContent=label;const v=document.createElement('span');v.className='pill '+kind;v.textContent=value;row.append(l,v);return row}
 async function load(){byId('updated').textContent='Refreshing…';byId('updated').className='foot loading';try{const response=await fetch('/testing/dashboard/data',{cache:'no-store'});if(!response.ok)throw new Error('Dashboard data request failed ('+response.status+')');const data=await response.json();const d=data.dhan||{};const counts=data.counts||{};
-  byId('db-name').textContent=data.database||'Unknown database';
+  byId('db-name').textContent=data.database||'Unknown database';byId('sync-dhan').dataset.accountAvailable=String(Boolean(d.account_exists));byId('sync-dhan').disabled=!d.account_exists;
   const kpiValues=[number(d.holdings_rows),number(d.trade_rows),money(d.holdings_market_value),`${number(d.quantity_matching_groups||0)} / ${number(d.matched_security_groups||0)}`];
   [...byId('kpis').children].forEach((card,i)=>{card.querySelector('.value').textContent=kpiValues[i]});
   const health=byId('health');health.replaceChildren();
@@ -326,7 +326,8 @@ async function load(){byId('updated').textContent='Refreshing…';byId('updated'
   const matched=(d.matched_security_groups||0),same=(d.quantity_matching_groups||0);byId('recon-status').textContent=`${number(same)} / ${number(matched)} net flows equal snapshot`;byId('recon-status').className='pill '+(same===matched&&matched>0?'ok':'warn');
   byId('updated').textContent='Live TEST data · refreshed '+new Date().toLocaleTimeString('en-IN');byId('updated').className='foot';
  }catch(error){byId('updated').textContent=error.message;byId('updated').className='foot error'}}
-byId('refresh').addEventListener('click',load);load();
+async function syncDhan(){if(!window.confirm('Fetch and save a new Dhan holdings snapshot in the TEST database? No trades will be fetched.'))return;const button=byId('sync-dhan'),status=byId('sync-status');button.disabled=true;status.textContent='Fetching holdings…';status.className='foot loading';try{const response=await fetch('/portfolio/dhan/sync',{method:'POST',headers:{'Accept':'application/json'}});const body=await response.json();if(!response.ok)throw new Error(body.detail||'Dhan holdings sync failed.');status.textContent=`Completed · ${number(body.records_processed)} holdings rows saved.`;status.className='foot';await load()}catch(error){status.textContent=error.message;status.className='foot error'}finally{button.disabled=button.dataset.accountAvailable!=='true'}}
+byId('refresh').addEventListener('click',load);byId('sync-dhan').addEventListener('click',syncDhan);load();
 </script>
 </body>
 </html>"""
