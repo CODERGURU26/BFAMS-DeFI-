@@ -15,7 +15,7 @@ from app.integrations.setu.exceptions import (
 )
 
 SETU_SANDBOX_BASE_URL = "https://fiu-sandbox.setu.co"
-SETU_TOKEN_URL = "https://orgservice-prod.setu.co/v1/users/login"
+SETU_TOKEN_URL = "https://accountservice.setu.co/v1/users/login"
 SETU_TOKEN_CLIENT_HEADER = "bridge"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
