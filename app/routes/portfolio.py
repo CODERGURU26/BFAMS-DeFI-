@@ -73,7 +73,7 @@ from app.integrations.dhan.holdings import (
 )
 from app.integrations.dhan.valuation import (
     DhanValuationError,
-    fetch_live_dhan_valuation,
+    fetch_live_dhan_portfolio,
 )
 from app.integrations.dhan.settings import demo_sync_enabled
 
@@ -156,13 +156,12 @@ class DhanSyncResponse(BaseModel):
 class DhanLiveValuationResponse(BaseModel):
     retrieved_at: datetime
     holdings_count: int
-    priced_count: int
-    unpriced_count: int
-    coverage_complete: bool
-    invested_amount: Optional[str]
-    current_value: Optional[str]
-    overall_pnl: Optional[str]
-    today_pnl: Optional[str]
+    position_count: int
+    orders_count: int
+    realized_pnl: Optional[str]
+    unrealized_pnl: Optional[str]
+    day_pnl: Optional[str]
+    open_positions: List[Dict[str, Optional[str]]]
 
 
 # ---------------------------------------------------------------------------
@@ -380,8 +379,8 @@ def sync_dhan_holdings(
     response_model=DhanLiveValuationResponse,
     summary="Fetch live Dhan portfolio valuation",
     description=(
-        "Reads Dhan holdings and market quotes without writing to the database. "
-        "Totals are returned only when every positive-quantity holding has a quote."
+        "Reads Dhan holdings, positions, and today's orders without writing "
+        "to the database. P&L fields come directly from position responses."
     ),
 )
 def get_dhan_live_valuation(
@@ -394,7 +393,7 @@ def get_dhan_live_valuation(
 
     try:
         with DhanClient.from_environment() as client:
-            valuation = fetch_live_dhan_valuation(client)
+            valuation = fetch_live_dhan_portfolio(client)
     except DhanConfigurationError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -414,29 +413,24 @@ def get_dhan_live_valuation(
     return DhanLiveValuationResponse(
         retrieved_at=valuation["retrieved_at"],
         holdings_count=valuation["holdings_count"],
-        priced_count=valuation["priced_count"],
-        unpriced_count=valuation["unpriced_count"],
-        coverage_complete=valuation["coverage_complete"],
-        invested_amount=(
-            str(valuation["invested_amount"])
-            if valuation["invested_amount"] is not None
+        position_count=valuation["position_count"],
+        orders_count=valuation["orders_count"],
+        realized_pnl=(
+            str(valuation["realized_pnl"])
+            if valuation["realized_pnl"] is not None
             else None
         ),
-        current_value=(
-            str(valuation["current_value"])
-            if valuation["current_value"] is not None
+        unrealized_pnl=(
+            str(valuation["unrealized_pnl"])
+            if valuation["unrealized_pnl"] is not None
             else None
         ),
-        overall_pnl=(
-            str(valuation["overall_pnl"])
-            if valuation["overall_pnl"] is not None
+        day_pnl=(
+            str(valuation["day_pnl"])
+            if valuation["day_pnl"] is not None
             else None
         ),
-        today_pnl=(
-            str(valuation["today_pnl"])
-            if valuation["today_pnl"] is not None
-            else None
-        ),
+        open_positions=valuation["open_positions"],
     )
 
 

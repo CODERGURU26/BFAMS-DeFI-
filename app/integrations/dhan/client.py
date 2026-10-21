@@ -1,4 +1,4 @@
-"""Restricted Dhan client for reading account holdings."""
+"""Read-only Dhan client for holdings, positions, and orders."""
 
 import json
 import logging
@@ -11,10 +11,8 @@ from app.integrations.dhan.settings import dhan_credentials
 
 
 DHAN_HOLDINGS_URL = "https://api.dhan.co/v2/holdings"
-DHAN_MARKET_QUOTE_URL = "https://api.dhan.co/v2/marketfeed/quote"
-DHAN_INSTRUMENT_MASTER_URL = (
-    "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
-)
+DHAN_POSITIONS_URL = "https://api.dhan.co/v2/positions"
+DHAN_ORDERS_URL = "https://api.dhan.co/v2/orders"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 logger = logging.getLogger(__name__)
 _SENSITIVE_KEY_PARTS = (
@@ -129,8 +127,8 @@ class DhanAPIError(RuntimeError):
         )
         safe_operation = {
             "holdings": "holdings",
-            "market quote": "market quote",
-            "instrument master": "instrument master",
+            "positions": "positions",
+            "orders": "orders",
         }.get(operation, "API")
         self.operation = safe_operation
         message = (
@@ -192,16 +190,34 @@ class DhanClient:
         self.close()
 
     def get_holdings(self) -> list[dict[str, Any]]:
+        return self._get_list(
+            DHAN_HOLDINGS_URL,
+            operation="holdings",
+        )
+
+    def get_positions(self) -> list[dict[str, Any]]:
+        return self._get_list(
+            DHAN_POSITIONS_URL,
+            operation="positions",
+        )
+
+    def get_orders(self) -> list[dict[str, Any]]:
+        return self._get_list(
+            DHAN_ORDERS_URL,
+            operation="orders",
+        )
+
+    def _get_list(self, url: str, *, operation: str) -> list[dict[str, Any]]:
         try:
-            response = self._client.get(DHAN_HOLDINGS_URL, headers=self._headers)
+            response = self._client.get(url, headers=self._headers)
         except httpx.TimeoutException as exc:
-            raise DhanAPIError(operation="holdings") from exc
+            raise DhanAPIError(operation=operation) from exc
         except httpx.TransportError as exc:
-            raise DhanAPIError(operation="holdings") from exc
+            raise DhanAPIError(operation=operation) from exc
 
         _log_request_result(
-            operation="holdings",
-            url=DHAN_HOLDINGS_URL,
+            operation=operation,
+            url=url,
             status_code=response.status_code,
             response_body=response.text,
             headers=self._headers,
@@ -210,98 +226,16 @@ class DhanClient:
         if response.status_code < 200 or response.status_code >= 300:
             raise DhanAPIError(
                 response.status_code,
-                operation="holdings",
+                operation=operation,
                 response_body=response.text,
                 secrets=self._secrets,
             )
         try:
             payload = response.json()
         except ValueError as exc:
-            raise DhanAPIError(operation="holdings") from exc
+            raise DhanAPIError(operation=operation) from exc
         if not isinstance(payload, list) or any(
             not isinstance(row, dict) for row in payload
         ):
-            raise DhanAPIError(operation="holdings")
+            raise DhanAPIError(operation=operation)
         return payload
-
-    def get_market_quote(
-        self, instruments: dict[str, list[int]]
-    ) -> dict[str, Any]:
-        if not instruments or any(
-            segment not in {"NSE_EQ", "BSE_EQ"}
-            or not security_ids
-            or any(security_id <= 0 for security_id in security_ids)
-            for segment, security_ids in instruments.items()
-        ):
-            raise DhanAPIError(operation="market quote")
-        if sum(len(security_ids) for security_ids in instruments.values()) > 1000:
-            raise DhanAPIError(operation="market quote")
-        try:
-            request_headers = self._headers | {"Content-Type": "application/json"}
-            response = self._client.post(
-                DHAN_MARKET_QUOTE_URL,
-                headers=request_headers,
-                json=instruments,
-            )
-        except httpx.TimeoutException as exc:
-            raise DhanAPIError(operation="market quote") from exc
-        except httpx.TransportError as exc:
-            raise DhanAPIError(operation="market quote") from exc
-
-        payload_summary = {
-            segment: {"instrument_count": len(security_ids)}
-            for segment, security_ids in instruments.items()
-        }
-        _log_request_result(
-            operation="market quote",
-            url=DHAN_MARKET_QUOTE_URL,
-            status_code=response.status_code,
-            response_body=response.text,
-            headers=request_headers,
-            payload_summary=payload_summary,
-            secrets=self._secrets,
-        )
-        if response.status_code < 200 or response.status_code >= 300:
-            raise DhanAPIError(
-                response.status_code,
-                operation="market quote",
-                response_body=response.text,
-                secrets=self._secrets,
-            )
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise DhanAPIError(operation="market quote") from exc
-        if (
-            not isinstance(payload, dict)
-            or not isinstance(payload.get("data"), dict)
-        ):
-            raise DhanAPIError(operation="market quote")
-        return payload
-
-    def get_instrument_master(self) -> str:
-        try:
-            response = self._client.get(DHAN_INSTRUMENT_MASTER_URL)
-        except httpx.TimeoutException as exc:
-            raise DhanAPIError(operation="instrument master") from exc
-        except httpx.TransportError as exc:
-            raise DhanAPIError(operation="instrument master") from exc
-
-        _log_request_result(
-            operation="instrument master",
-            url=DHAN_INSTRUMENT_MASTER_URL,
-            status_code=response.status_code,
-            response_body=response.text,
-            headers={},
-            secrets=self._secrets,
-        )
-        if response.status_code < 200 or response.status_code >= 300:
-            raise DhanAPIError(
-                response.status_code,
-                operation="instrument master",
-                response_body=response.text,
-                secrets=self._secrets,
-            )
-        if not response.text.strip():
-            raise DhanAPIError(operation="instrument master")
-        return response.text

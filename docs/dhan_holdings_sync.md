@@ -27,27 +27,28 @@ prices and market values. Equity valuation can use the stored
 `InvestmentHolding.unit_price` as its fallback when no NSE close exists; this
 sync intentionally leaves that value NULL.
 
-## Live Dhan valuation
+## Live Dhan positions and P&L
 
 The dashboard's **Fetch from Dhan** action calls the read-only
-`POST /portfolio/dhan/live-valuation` route. It requires the same local-only
-guards as holdings sync and verifies the TEST database, but it does not write
-holdings, prices, or audit rows.
+`POST /portfolio/dhan/live-valuation` route. It uses only the Dhan Holdings,
+Positions, and Orders APIs. It requires the same local-only guards as holdings
+sync and verifies the TEST database, but does not write holdings, prices, or
+audit rows. Orders are read only to report today's order count; the integration
+never places, modifies, or cancels an order.
 
-The calculation uses Dhan's documented `avgCostPrice` and `totalQty` fields
-for invested amount, then the Dhan market-feed quote endpoint's `last_price`
-and `net_change` fields for current value, overall P&L, and today's P&L. The
-official detailed instrument master is matched on security ID and ISIN to
-determine the NSE/BSE quote segment. Individual holding data is not returned
-by this route. Current value and P&L remain unavailable unless every positive-
-quantity holding has a valid quote; a partial quote set is never shown as the
-account total.
+Realized and unrealized P&L are summed from the position rows. The adapter
+prefers `realizedPnl` and `unrealizedPnl` when present and also supports the
+documented Dhan v2 field names `realizedProfit` and `unrealizedProfit`.
+`dayPnl` is reported only when Dhan supplies it; the documented v2 Positions
+schema does not currently list that field, so the application does not
+calculate a substitute. Open positions are returned as the small set of
+instrument, position/product type, net quantity, and provider P&L fields
+needed by the dashboard.
 
-The Dhan access token must be authorized for Market Quote API access in
-addition to Holdings. A market-feed HTTP 401 is surfaced with its status only;
-the provider response body and account data are not exposed. `GET /positions`
-is not used for demat valuation because it covers open positions for the day
-and may be empty when there are no open positions.
+No Market Feed/Market Quote endpoint or instrument-master download is used.
+The current-value total and holdings cost basis are not included in this
+summary because the permitted APIs used here do not provide a guaranteed
+complete current market valuation for the demat holdings.
 
 The API client, response validation, and row mapping can be checked without
 network or database access with:

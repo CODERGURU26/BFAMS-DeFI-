@@ -1,14 +1,12 @@
-"""Read-only Dhan portfolio valuation from holdings and market quotes."""
+"""Read-only Dhan portfolio and open-position summaries."""
 
-import csv
-import io
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 
 class DhanValuationError(ValueError):
-    """Raised when Dhan valuation inputs cannot be reconciled safely."""
+    """Raised when Dhan portfolio data cannot be reconciled safely."""
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -19,143 +17,94 @@ def _decimal(value: Any) -> Decimal | None:
     return result if result.is_finite() else None
 
 
-def _instrument_segments(instrument_master: str) -> dict[tuple[str, str], set[str]]:
-    try:
-        reader = csv.DictReader(io.StringIO(instrument_master))
-        result: dict[tuple[str, str], set[str]] = {}
-        for row in reader:
-            if row.get("SEGMENT") != "E":
-                continue
-            exchange = row.get("EXCH_ID")
-            if exchange not in {"NSE", "BSE"}:
-                continue
-            security_id = (row.get("SECURITY_ID") or "").strip()
-            isin = (row.get("ISIN") or "").strip().upper()
-            if not security_id or not isin:
-                continue
-            segment = f"{exchange}_EQ"
-            result.setdefault((security_id, isin), set()).add(segment)
-    except (csv.Error, UnicodeError) as exc:
-        raise DhanValuationError("Dhan instrument master is invalid.") from exc
-    return result
+def _position_pnl(item: dict[str, Any], preferred: str, documented: str) -> Decimal | None:
+    value = item.get(preferred)
+    if value is None:
+        value = item.get(documented)
+    return _decimal(value)
 
 
-def build_live_dhan_valuation(
-    holdings: list[dict[str, Any]],
-    instrument_master: str,
-    quote_payload: dict[str, Any],
-) -> dict[str, Any]:
-    """Calculate account-level values; never returns individual holding data."""
-    segment_map = _instrument_segments(instrument_master)
-    quote_data = quote_payload.get("data")
-    if not isinstance(quote_data, dict):
-        raise DhanValuationError("Dhan market quote response is invalid.")
+def _sum_position_pnl(
+    positions: list[dict[str, Any]],
+    preferred: str,
+    documented: str | None = None,
+) -> Decimal | None:
+    if not positions:
+        return Decimal(0)
+    values = [
+        _position_pnl(item, preferred, documented or preferred)
+        for item in positions
+    ]
+    if any(value is None for value in values):
+        return None
+    return sum((value for value in values if value is not None), Decimal(0))
 
-    normalized: list[tuple[Decimal, Decimal | None, str | None, int | None]] = []
-    instruments: dict[str, set[int]] = {}
-    for item in holdings:
-        quantity = _decimal(item.get("totalQty"))
-        if quantity is None or quantity < 0:
-            raise DhanValuationError("Dhan holdings response has invalid quantity.")
-        if quantity == 0:
-            continue
 
-        average_cost = _decimal(item.get("avgCostPrice"))
-        raw_security_id = item.get("securityId")
-        raw_isin = item.get("isin")
-        security_id = str(raw_security_id).strip() if raw_security_id else ""
-        isin = str(raw_isin).strip().upper() if raw_isin else ""
-        matching_segments = segment_map.get((security_id, isin), set())
-        segment = next(iter(matching_segments)) if len(matching_segments) == 1 else None
-        numeric_security_id = None
-        if segment is not None:
-            try:
-                numeric_security_id = int(security_id)
-            except ValueError:
-                segment = None
-            else:
-                instruments.setdefault(segment, set()).add(numeric_security_id)
-        normalized.append((quantity, average_cost, segment, numeric_security_id))
-
-    invested_complete = all(cost is not None for _, cost, _, _ in normalized)
-    invested_amount = (
-        sum(
-            (quantity * cost for quantity, cost, _, _ in normalized if cost is not None),
-            Decimal(0),
-        )
-        if invested_complete
-        else None
-    )
-
-    quoted_values: list[tuple[Decimal, Decimal]] = []
-    for quantity, _, segment, security_id in normalized:
-        quote = None
-        if segment is not None and security_id is not None:
-            segment_quotes = quote_data.get(segment, {})
-            if isinstance(segment_quotes, dict):
-                quote = segment_quotes.get(str(security_id))
-        if not isinstance(quote, dict):
-            continue
-        last_price = _decimal(quote.get("last_price"))
-        net_change = _decimal(quote.get("net_change"))
-        if last_price is None or last_price < 0 or net_change is None:
-            continue
-        quoted_values.append((quantity * last_price, quantity * net_change))
-
-    priced_count = len(quoted_values)
-    holdings_count = len(normalized)
-    coverage_complete = priced_count == holdings_count
-    current_value = (
-        sum((market_value for market_value, _ in quoted_values), Decimal(0))
-        if coverage_complete
-        else None
-    )
-    today_pnl = (
-        sum((daily_change for _, daily_change in quoted_values), Decimal(0))
-        if coverage_complete
-        else None
-    )
-    overall_pnl = (
-        current_value - invested_amount
-        if current_value is not None and invested_amount is not None
-        else None
-    )
+def _open_position(item: dict[str, Any]) -> dict[str, Any]:
+    quantity = item.get("netQty")
+    if quantity is None:
+        quantity = item.get("netQuantity")
+    position_type = item.get("positionType")
+    is_open = _decimal(quantity)
+    if (is_open is not None and is_open == 0) or str(position_type).upper() == "CLOSED":
+        return {}
 
     return {
-        "retrieved_at": datetime.now(timezone.utc),
-        "holdings_count": len(holdings),
-        "priced_count": priced_count,
-        "unpriced_count": holdings_count - priced_count,
-        "coverage_complete": coverage_complete,
-        "invested_amount": invested_amount,
-        "current_value": current_value,
-        "overall_pnl": overall_pnl,
-        "today_pnl": today_pnl,
+        "trading_symbol": item.get("tradingSymbol"),
+        "position_type": position_type,
+        "product_type": item.get("productType"),
+        "net_quantity": str(quantity) if quantity is not None else None,
+        "realized_pnl": _string_value(
+            _position_pnl(item, "realizedPnl", "realizedProfit")
+        ),
+        "unrealized_pnl": _string_value(
+            _position_pnl(item, "unrealizedPnl", "unrealizedProfit")
+        ),
+        "day_pnl": _string_value(_decimal(item.get("dayPnl"))),
     }
 
 
-def fetch_live_dhan_valuation(client: Any) -> dict[str, Any]:
-    holdings = client.get_holdings()
-    instrument_master = client.get_instrument_master()
-    segments = _instrument_segments(instrument_master)
-    requested: dict[str, set[int]] = {}
-    for item in holdings:
-        security_id = str(item.get("securityId") or "").strip()
-        isin = str(item.get("isin") or "").strip().upper()
-        matches = segments.get((security_id, isin), set())
-        if len(matches) != 1:
-            continue
-        try:
-            numeric_security_id = int(security_id)
-        except ValueError:
-            continue
-        requested.setdefault(next(iter(matches)), set()).add(numeric_security_id)
+def _string_value(value: Decimal | None) -> str | None:
+    return str(value) if value is not None else None
 
-    quote_payload = (
-        client.get_market_quote(
-            {segment: sorted(security_ids) for segment, security_ids in requested.items()}
-        )
-        if requested
-        else {"data": {}}
-    )
-    return build_live_dhan_valuation(holdings, instrument_master, quote_payload)
+
+def build_live_dhan_portfolio(
+    holdings: list[dict[str, Any]],
+    positions: list[dict[str, Any]],
+    orders: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Summarize Dhan API data without deriving P&L from market prices."""
+    if not all(isinstance(row, dict) for row in holdings + positions + orders):
+        raise DhanValuationError("Dhan portfolio response is invalid.")
+
+    open_positions = [
+        row
+        for item in positions
+        if (row := _open_position(item))
+    ]
+    return {
+        "retrieved_at": datetime.now(timezone.utc),
+        "holdings_count": len(holdings),
+        "position_count": len(positions),
+        "orders_count": len(orders),
+        "realized_pnl": _sum_position_pnl(
+            positions,
+            "realizedPnl",
+            "realizedProfit",
+        ),
+        "unrealized_pnl": _sum_position_pnl(
+            positions,
+            "unrealizedPnl",
+            "unrealizedProfit",
+        ),
+        "day_pnl": _sum_position_pnl(positions, "dayPnl"),
+        "open_positions": open_positions,
+    }
+
+
+def fetch_live_dhan_portfolio(client: Any) -> dict[str, Any]:
+    """Fetch holdings, positions, and today's order book without writing."""
+    holdings = client.get_holdings()
+    positions = client.get_positions()
+    orders = client.get_orders()
+    return build_live_dhan_portfolio(holdings, positions, orders)
