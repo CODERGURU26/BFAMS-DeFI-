@@ -3,25 +3,12 @@
 from typing import Any
 
 import httpx
-from pydantic import Field, SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.integrations.dhan.settings import dhan_credentials
 
 
 DHAN_HOLDINGS_URL = "https://api.dhan.co/v2/holdings"
 DEFAULT_TIMEOUT_SECONDS = 30.0
-
-
-class DhanSettings(BaseSettings):
-    client_id: SecretStr = Field(default=SecretStr(""), validation_alias="DHAN_CLIENT_ID")
-    access_token: SecretStr = Field(
-        default=SecretStr(""), validation_alias="DHAN_ACCESS_TOKEN"
-    )
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
 
 
 class DhanConfigurationError(RuntimeError):
@@ -75,12 +62,8 @@ class DhanClient:
         *,
         transport: httpx.BaseTransport | None = None,
     ) -> "DhanClient":
-        settings = DhanSettings()
-        return cls(
-            settings.client_id.get_secret_value(),
-            settings.access_token.get_secret_value(),
-            transport=transport,
-        )
+        client_id, access_token = dhan_credentials()
+        return cls(client_id, access_token, transport=transport)
 
     def close(self) -> None:
         self._client.close()

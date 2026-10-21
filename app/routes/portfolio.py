@@ -23,11 +23,21 @@ GET  /portfolio/valuation/{account_id}
 """
 
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    File,
+    status,
+)
 from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -35,6 +45,7 @@ from sqlalchemy.orm import Session
 from app.dependencies import get_mf_db
 from app.models import (
     DataProvider,
+    DataSyncRun,
     FinancialAccount,
     FinancialConnection,
     InvestmentHolding,
@@ -57,8 +68,10 @@ from app.integrations.dhan.client import (
 )
 from app.integrations.dhan.holdings import (
     DhanHoldingsValidationError,
+    analyze_dhan_holdings,
     persist_dhan_holdings,
 )
+from app.integrations.dhan.settings import demo_sync_enabled
 
 router = APIRouter(prefix="/portfolio", tags=["Portfolio"])
 
@@ -125,8 +138,15 @@ class PortfolioValuationResponse(BaseModel):
 
 
 class DhanSyncResponse(BaseModel):
-    status: str
-    records_processed: int
+    fetched: int
+    to_insert: int
+    skipped_zero_qty: int
+    same_quantity: int
+    different_quantity: int
+    new_in_api: int
+    absent_from_api: int
+    inferred_from_symbol_only: int
+    without_isin: int
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +230,87 @@ def _summary_to_response(summary: IngestionSummary) -> IngestionResponse:
         "snapshot for the configured Dhan TEST account. No trades are fetched."
     ),
 )
-def sync_dhan_holdings(session: Session = Depends(get_mf_db)) -> DhanSyncResponse:
+def sync_dhan_holdings(
+    request: Request,
+    dry_run: bool = Query(True, description="Fetch and validate without writing"),
+    session: Session = Depends(get_mf_db),
+) -> DhanSyncResponse:
+    if not demo_sync_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Dhan demo sync is disabled.",
+        )
+
+    if request.headers.getlist("x-bfams-sync") != ["1"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Required sync confirmation header is missing.",
+        )
+
+    host_values = request.headers.getlist("host")
+    host = host_values[0] if len(host_values) == 1 else ""
+    parsed_host = None
+    try:
+        parsed_host = urlsplit(f"//{host}")
+        host_name = (parsed_host.hostname or "").lower()
+        host_port = parsed_host.port
+    except ValueError:
+        host_name = ""
+        host_port = None
+    if (
+        parsed_host is None
+        or host_name not in {"127.0.0.1", "localhost"}
+        or host_port is None
+        or host_port == 0
+        or len(host_values) != 1
+        or parsed_host.username is not None
+        or parsed_host.password is not None
+        or parsed_host.path
+        or parsed_host.query
+        or parsed_host.fragment
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Dhan demo sync is limited to the local dashboard.",
+        )
+
+    origin_values = request.headers.getlist("origin")
+    if len(origin_values) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Dhan demo sync origin is not allowed.",
+        )
+    origin = origin_values[0] if origin_values else None
+    if request.url.scheme not in {"http", "https"}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Dhan demo sync origin is not allowed.",
+        )
+    dashboard_origin = f"{request.url.scheme}://{host}"
+    if origin is not None and origin != dashboard_origin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Dhan demo sync origin is not allowed.",
+        )
+
     _verify_test_db(session)
     account = _get_dhan_account(session)
+
+    cooldown_start = datetime.now(timezone.utc) - timedelta(seconds=60)
+    recent_sync = session.scalar(
+        select(DataSyncRun.id)
+        .where(
+            DataSyncRun.connection_id == account.connection_id,
+            DataSyncRun.sync_type == "holdings_only",
+            DataSyncRun.started_at >= cooldown_start,
+        )
+        .limit(1)
+    )
+    if recent_sync is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Dhan sync was started recently.",
+        )
 
     try:
         with DhanClient.from_environment() as client:
@@ -225,24 +323,64 @@ def sync_dhan_holdings(session: Session = Depends(get_mf_db)) -> DhanSyncRespons
         ) from exc
     except DhanAPIError as exc:
         session.rollback()
+        if not dry_run:
+            _record_failed_dhan_sync(session, account, exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=str(exc),
+            detail=(
+                f"Dhan holdings request failed (HTTP {exc.status_code})."
+                if exc.status_code is not None
+                else "Dhan holdings request failed."
+            ),
         ) from exc
 
     try:
-        inserted = persist_dhan_holdings(session, account, payload)
-    except DhanHoldingsValidationError as exc:
+        if dry_run:
+            plan = analyze_dhan_holdings(session, account, payload)
+            return DhanSyncResponse(**plan.counts())
+        result_counts = persist_dhan_holdings(session, account, payload)
+    except Exception as exc:
         session.rollback()
+        if not dry_run:
+            _record_failed_dhan_sync(session, account, exc)
+        detail = (
+            "Dhan returned an invalid holdings response."
+            if isinstance(exc, DhanHoldingsValidationError)
+            else "Dhan holdings sync failed."
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Dhan returned an invalid holdings response.",
-        ) from exc
+            detail=detail,
+        ) from None
+
+    return DhanSyncResponse(**result_counts)
+
+
+def _record_failed_dhan_sync(
+    session: Session,
+    account: FinancialAccount,
+    error: Exception,
+) -> None:
+    session.rollback()
+    try:
+        _verify_test_db(session)
+        session.add(
+            DataSyncRun(
+                connection_id=account.connection_id,
+                sync_type="holdings_only",
+                status="failed",
+                completed_at=datetime.now(timezone.utc),
+                records_processed=0,
+                error_message=type(error).__name__,
+            )
+        )
+        session.commit()
     except Exception:
         session.rollback()
-        raise
-
-    return DhanSyncResponse(status="completed", records_processed=inserted)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Dhan sync failure could not be recorded.",
+        ) from None
 
 
 # ---------------------------------------------------------------------------
