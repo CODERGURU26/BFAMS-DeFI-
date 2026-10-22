@@ -29,6 +29,10 @@ All routes use the `/auth` prefix.
 | `POST` | `/auth/login` | Verify email and password; return a short-lived bearer access token and set a refresh cookie |
 | `POST` | `/auth/refresh` | Rotate the refresh token and return a new access token |
 | `POST` | `/auth/logout` | Revoke the refresh-token family and clear the refresh cookie |
+| `GET` | `/auth/sessions` | List active refresh-token sessions without token material |
+| `POST` | `/auth/sessions/{session_id}/revoke` | Revoke one owned session family |
+| `POST` | `/auth/logout-all` | Revoke all refresh-token sessions for the authenticated user |
+| `POST` | `/auth/change-password` | Verify and replace the password; revoke all refresh sessions |
 | `GET` | `/auth/me` | Return the authenticated user's ID and email |
 | `POST` | `/auth/register` | Create a user and credential when registration is enabled |
 
@@ -36,6 +40,11 @@ The refresh cookie is named `bfams_refresh`, is HttpOnly, SameSite Strict, scope
 to `/auth`, and lasts seven days. Refresh and logout require the
 `X-BFAMS-Auth: 1` header. If an `Origin` header is present, it must match the
 request origin.
+
+Login failures are limited per client IP to five per minute and twenty per
+hour. Authentication endpoints also enforce account lockout after consecutive
+credential failures. Security headers are applied to all responses, including
+the interactive API documentation.
 
 ## Security notes
 
@@ -47,7 +56,9 @@ consecutive failures lock the credential for 15 minutes.
 Access tokens use HS256 and expire after 15 minutes. Refresh tokens are random
 opaque values; only their SHA-256 hashes are stored. Refresh-token reuse
 revokes the associated token family. Changing a password invalidates access
-tokens issued before the recorded password-change time.
+tokens issued before the recorded password-change time. Authentication audit
+events contain only user references, event types, and timestamps; authentication
+secrets and credential values are not event fields.
 
 Authentication is not authorization: this phase intentionally does not attach
 the user dependency to unrelated routes.

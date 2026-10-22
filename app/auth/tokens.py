@@ -41,8 +41,8 @@ def create_access_token(
     claims = {
         "sub": subject,
         "iss": ISSUER,
-        "iat": issued_at,
-        "exp": expires_at,
+        "iat": issued_at.timestamp(),
+        "exp": expires_at.timestamp(),
         "jti": str(uuid.uuid4()),
         "typ": "access",
     }
@@ -93,7 +93,7 @@ def decode_access_token(
             isinstance(issued_at, bool)
             or not isinstance(issued_at, (int, float))
             or not math.isfinite(issued_at)
-            or math.floor(issued_at) < math.floor(changed_at.timestamp())
+            or issued_at < changed_at.timestamp()
         ):
             raise AccessTokenError("Invalid access token.")
     return claims

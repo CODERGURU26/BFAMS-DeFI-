@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from sqlalchemy import text
 from database import engine
 from app.routes import (
@@ -18,6 +18,35 @@ app = FastAPI(
     description="Backend API for financial data and analytics",
     version="0.1.0",
 )
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault(
+        "Referrer-Policy",
+        "strict-origin-when-cross-origin",
+    )
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "accelerometer=(), camera=(), geolocation=(), microphone=()",
+    )
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "base-uri 'self'; "
+        "object-src 'none'; "
+        "frame-ancestors 'none'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "img-src 'self' data: https://fastapi.tiangolo.com; "
+        "font-src 'self' data: https://cdn.jsdelivr.net; "
+        "connect-src 'self'",
+    )
+    return response
+
 
 app.include_router(accounts.router)
 app.include_router(transactions.router)

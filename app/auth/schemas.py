@@ -38,3 +38,8 @@ class UserResponse(BaseModel):
 
 class RegistrationResponse(BaseModel):
     user_id: uuid.UUID
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str
+    new_password: str

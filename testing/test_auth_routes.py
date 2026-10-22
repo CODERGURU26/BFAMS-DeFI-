@@ -1,6 +1,7 @@
 import os
 import unittest
 import uuid
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -71,6 +72,8 @@ class AuthRouteTests(unittest.TestCase):
             cls.engine.dispose()
 
     def setUp(self):
+        with routes._LOGIN_FAILURES_LOCK:
+            routes._LOGIN_FAILURES_BY_IP.clear()
         self.secret = "route-test-secret-that-is-long-enough"
         self.environment = patch.dict(
             os.environ,
@@ -93,6 +96,8 @@ class AuthRouteTests(unittest.TestCase):
         self.db.close()
         self.client.close()
         self.environment.stop()
+        with routes._LOGIN_FAILURES_LOCK:
+            routes._LOGIN_FAILURES_BY_IP.clear()
 
     def _create_user(
         self,
@@ -144,6 +149,65 @@ class AuthRouteTests(unittest.TestCase):
         self.assertNotIn(self.email, response.text.lower())
         self.assertNotIn("long-enough-test-password", response.text)
         self.assertNotIn(self.secret, response.text)
+
+    def test_login_rate_limit_and_successful_attempts_are_not_counted(self):
+        self._create_user()
+        success = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "long-enough-test-password",
+            },
+        )
+        self.assertEqual(success.status_code, 200)
+
+        for _ in range(5):
+            failure = self.client.post(
+                "/auth/login",
+                json={
+                    "email": self.email,
+                    "password": "incorrect-test-password",
+                },
+            )
+            self.assertEqual(failure.status_code, 401)
+        limited = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "incorrect-test-password",
+            },
+        )
+        self.assertEqual(limited.status_code, 429)
+        self.assertEqual(
+            limited.json(),
+            {"detail": "Too many login attempts. Please try again later."},
+        )
+        self.assertNotIn(self.email, limited.text)
+
+    def test_hourly_login_limit(self):
+        self._create_user()
+        with patch.object(
+            routes,
+            "_LOGIN_RATE_LIMITS",
+            ((20, timedelta(hours=1)),),
+        ):
+            for _ in range(20):
+                response = self.client.post(
+                    "/auth/login",
+                    json={
+                        "email": self.email,
+                        "password": "incorrect-test-password",
+                    },
+                )
+                self.assertEqual(response.status_code, 401)
+            limited = self.client.post(
+                "/auth/login",
+                json={
+                    "email": self.email,
+                    "password": "incorrect-test-password",
+                },
+            )
+        self.assertEqual(limited.status_code, 429)
 
     def test_unknown_and_wrong_password_have_identical_responses(self):
         self._create_user()
@@ -368,6 +432,325 @@ class AuthRouteTests(unittest.TestCase):
         self.assertIsNotNone(refresh.revoked_at)
         self.assertIn("max-age=0", response.headers["set-cookie"].lower())
 
+    def test_session_listing_returns_metadata_only_and_marks_current(self):
+        self._create_user()
+        first = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "long-enough-test-password",
+            },
+        )
+        first_raw = self.client.cookies.get("bfams_refresh")
+        second = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "long-enough-test-password",
+            },
+        )
+        second_raw = self.client.cookies.get("bfams_refresh")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+
+        response = self.client.get(
+            "/auth/sessions",
+            headers={"Authorization": f"Bearer {second.json()['access_token']}"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        sessions = response.json()
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(sum(item["current"] for item in sessions), 1)
+        for item in sessions:
+            self.assertEqual(
+                set(item),
+                {"session_id", "issued_at", "expires_at", "current"},
+            )
+        for secret in (
+            first_raw,
+            second_raw,
+            tokens.hash_refresh_token(first_raw),
+            tokens.hash_refresh_token(second_raw),
+        ):
+            self.assertNotIn(secret, response.text)
+
+    def test_new_session_endpoints_require_authentication(self):
+        session_id = uuid.uuid4()
+        requests = (
+            ("GET", "/auth/sessions"),
+            ("POST", f"/auth/sessions/{session_id}/revoke"),
+            ("POST", "/auth/logout-all"),
+            (
+                "POST",
+                "/auth/change-password",
+                {
+                    "current_password": "long-enough-test-password",
+                    "new_password": "brand-new-long-password",
+                },
+            ),
+        )
+        for item in requests:
+            method, path, *body = item
+            with self.subTest(method=method, path=path):
+                response = self.client.request(
+                    method,
+                    path,
+                    json=body[0] if body else None,
+                    headers={"X-BFAMS-Auth": "1"},
+                )
+                self.assertEqual(response.status_code, 401)
+
+    def test_revoke_own_session_blocks_refresh_and_foreign_session_is_hidden(self):
+        credential_a = self._create_user()
+        login_a = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "long-enough-test-password",
+            },
+        )
+        raw_a = self.client.cookies.get("bfams_refresh")
+        row_a = self.db.scalar(
+            select(RefreshToken).where(
+                RefreshToken.token_hash == tokens.hash_refresh_token(raw_a)
+            )
+        )
+        response = self.client.post(
+            f"/auth/sessions/{row_a.id}/revoke",
+            headers={"Authorization": f"Bearer {login_a.json()['access_token']}"},
+        )
+        self.assertEqual(response.status_code, 204)
+        self.client.cookies.clear()
+        self.client.cookies.set(
+            "bfams_refresh",
+            raw_a,
+            domain="testserver",
+            path="/auth",
+        )
+        refresh = self.client.post(
+            "/auth/refresh",
+            headers={"X-BFAMS-Auth": "1"},
+        )
+        self.assertEqual(refresh.status_code, 401)
+
+        foreign_email = f"{uuid.uuid4()}@example.test"
+        credential_b = self._create_user(email=foreign_email)
+        self.client.cookies.clear()
+        login_b = self.client.post(
+            "/auth/login",
+            json={
+                "email": foreign_email,
+                "password": "long-enough-test-password",
+            },
+        )
+        raw_b = self.client.cookies.get("bfams_refresh")
+        row_b = self.db.scalar(
+            select(RefreshToken).where(
+                RefreshToken.token_hash == tokens.hash_refresh_token(raw_b)
+            )
+        )
+        foreign = self.client.post(
+            f"/auth/sessions/{row_b.id}/revoke",
+            headers={"Authorization": f"Bearer {login_a.json()['access_token']}"},
+        )
+        self.assertEqual(foreign.status_code, 404)
+        self.assertEqual(foreign.json(), {"detail": "Resource not found."})
+        self.assertNotIn(str(row_b.id), foreign.text)
+        self.assertIsNotNone(credential_a)
+        self.assertIsNotNone(credential_b)
+        self.assertEqual(login_b.status_code, 200)
+
+    def test_logout_all_revokes_every_refresh_family(self):
+        self._create_user()
+        first_login = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "long-enough-test-password",
+            },
+        )
+        first_raw = self.client.cookies.get("bfams_refresh")
+        second_login = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "long-enough-test-password",
+            },
+        )
+        second_raw = self.client.cookies.get("bfams_refresh")
+
+        response = self.client.post(
+            "/auth/logout-all",
+            headers={
+                "Authorization": f"Bearer {first_login.json()['access_token']}",
+                "X-BFAMS-Auth": "1",
+            },
+        )
+
+        self.assertEqual(response.status_code, 204)
+        for raw_token in (first_raw, second_raw):
+            self.client.cookies.clear()
+            self.client.cookies.set(
+                "bfams_refresh",
+                raw_token,
+                domain="testserver",
+                path="/auth",
+            )
+            refresh = self.client.post(
+                "/auth/refresh",
+                headers={"X-BFAMS-Auth": "1"},
+            )
+            self.assertEqual(refresh.status_code, 401)
+        self.assertEqual(second_login.status_code, 200)
+
+    def test_password_change_revokes_sessions_and_invalidates_old_access(self):
+        credential = self._create_user()
+        login = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "long-enough-test-password",
+            },
+        )
+        raw_refresh = self.client.cookies.get("bfams_refresh")
+        old_access = login.json()["access_token"]
+        changed_at_before = credential.password_changed_at
+
+        wrong_current = self.client.post(
+            "/auth/change-password",
+            headers={"Authorization": f"Bearer {old_access}"},
+            json={
+                "current_password": "incorrect-test-password",
+                "new_password": "brand-new-long-password",
+            },
+        )
+        self.assertEqual(wrong_current.status_code, 400)
+
+        changed = self.client.post(
+            "/auth/change-password",
+            headers={"Authorization": f"Bearer {old_access}"},
+            json={
+                "current_password": "long-enough-test-password",
+                "new_password": "brand-new-long-password",
+            },
+        )
+        self.assertEqual(changed.status_code, 204)
+        self.assertIn("max-age=0", changed.headers["set-cookie"].lower())
+        self.db.refresh(credential)
+        self.assertGreater(credential.password_changed_at, changed_at_before)
+        old_access_response = self.client.get(
+            "/auth/me",
+            headers={"Authorization": f"Bearer {old_access}"},
+        )
+        self.assertEqual(old_access_response.status_code, 401)
+        old_refresh_response = self.client.post(
+            "/auth/refresh",
+            headers={"X-BFAMS-Auth": "1"},
+            cookies={"bfams_refresh": raw_refresh},
+        )
+        self.assertEqual(old_refresh_response.status_code, 401)
+
+        new_login = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "brand-new-long-password",
+            },
+        )
+        self.assertEqual(new_login.status_code, 200)
+
+    def test_auth_events_are_limited_to_allowed_types_without_sensitive_fields(self):
+        credential = self._create_user()
+        failed = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "incorrect-test-password",
+            },
+        )
+        self.assertEqual(failed.status_code, 401)
+        login = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "long-enough-test-password",
+            },
+        )
+        self.assertEqual(login.status_code, 200)
+        raw = self.client.cookies.get("bfams_refresh")
+        refreshed = self.client.post(
+            "/auth/refresh",
+            headers={"X-BFAMS-Auth": "1"},
+        )
+        self.assertEqual(refreshed.status_code, 200)
+        reused = self.client.post(
+            "/auth/refresh",
+            headers={"X-BFAMS-Auth": "1"},
+            cookies={"bfams_refresh": raw},
+        )
+        self.assertEqual(reused.status_code, 401)
+        with patch.object(routes, "_LOGIN_FAILURES_BY_IP", defaultdict(deque)):
+            fresh_login = self.client.post(
+                "/auth/login",
+                json={
+                    "email": self.email,
+                    "password": "long-enough-test-password",
+                },
+            )
+        self.assertEqual(fresh_login.status_code, 200)
+        logout = self.client.post(
+            "/auth/logout",
+            headers={"X-BFAMS-Auth": "1"},
+        )
+        self.assertEqual(logout.status_code, 204)
+        changed = self.client.post(
+            "/auth/change-password",
+            headers={
+                "Authorization": f"Bearer {fresh_login.json()['access_token']}"
+            },
+            json={
+                "current_password": "long-enough-test-password",
+                "new_password": "brand-new-long-password",
+            },
+        )
+        self.assertEqual(changed.status_code, 204)
+        event_types = set(
+            self.db.scalars(
+                select(AuthEvent.event_type).where(
+                    AuthEvent.user_id == credential.user_id
+                )
+            ).all()
+        )
+        self.assertTrue(
+            {
+                "login_success",
+                "login_failed",
+                "refresh",
+                "refresh_reuse_detected",
+                "logout",
+                "password_changed",
+            }.issubset(event_types),
+            str(event_types),
+        )
+        self.assertTrue(
+            event_types.issubset(routes._ALLOWED_AUTH_EVENTS)
+        )
+        event_columns = set(AuthEvent.__table__.columns.keys())
+        self.assertFalse(
+            event_columns.intersection(
+                {
+                    "password",
+                    "password_hash",
+                    "email",
+                    "access_token",
+                    "refresh_token",
+                    "token_hash",
+                    "jwt_secret",
+                }
+            )
+        )
+
     def test_refresh_and_logout_enforce_request_protection(self):
         missing_header = self.client.post("/auth/refresh")
         self.assertEqual(missing_header.status_code, 400)
@@ -379,6 +762,13 @@ class AuthRouteTests(unittest.TestCase):
             },
         )
         self.assertEqual(foreign_origin.status_code, 403)
+        user = self._create_user()
+        access, _ = tokens.create_access_token(str(user.user_id))
+        logout_all_missing_header = self.client.post(
+            "/auth/logout-all",
+            headers={"Authorization": f"Bearer {access}"},
+        )
+        self.assertEqual(logout_all_missing_header.status_code, 400)
 
     def test_registration_disabled_and_enabled(self):
         disabled = self.client.post(
