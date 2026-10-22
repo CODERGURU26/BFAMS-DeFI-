@@ -5,6 +5,7 @@ from decimal import Decimal
 from sqlalchemy import (
     BigInteger,
     CHAR,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -315,5 +316,80 @@ class SecurityDailyPrice(Base):
     turnover_lacs: Mapped[Decimal | None] = mapped_column(Numeric(16, 4))
     source: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class UserCredential(Base):
+    __tablename__ = "user_credentials"
+
+    __table_args__ = (
+        CheckConstraint("email = lower(email)", name="user_credentials_email_lower"),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), primary_key=True
+    )
+    email: Mapped[str] = mapped_column(Text, unique=True)
+    password_hash: Mapped[str] = mapped_column(Text)
+    failed_attempts: Mapped[int] = mapped_column(Integer)
+    locked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    is_active: Mapped[bool] = mapped_column()
+    password_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    __table_args__ = (
+        Index("idx_refresh_tokens_family", "family_id"),
+        Index("idx_refresh_tokens_user", "user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    family_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    token_hash: Mapped[str] = mapped_column(Text, unique=True)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    replaced_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("refresh_tokens.id"), nullable=True
+    )
+
+
+class AuthEvent(Base):
+    __tablename__ = "auth_events"
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('register', 'login_success', 'login_failed', 'locked', "
+            "'refresh', 'refresh_reuse_detected', 'logout', 'password_changed')",
+            name="auth_events_event_type_check",
+        ),
+        Index(
+            "idx_auth_events_user_time",
+            "user_id",
+            text("occurred_at DESC"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
+    event_type: Mapped[str] = mapped_column(Text)
+    occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
