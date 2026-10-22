@@ -14,6 +14,7 @@ _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 class CredentialsRequest(BaseModel):
     email: str
     password: str
+    totp_code: str | None = None
 
     @field_validator("email")
     @classmethod
@@ -43,3 +44,21 @@ class RegistrationResponse(BaseModel):
 class PasswordChangeRequest(BaseModel):
     current_password: str
     new_password: str
+
+
+class TotpCodeRequest(BaseModel):
+    code: str
+
+
+class TotpDisableRequest(BaseModel):
+    password: str
+    code: str
+
+
+class TotpSetupResponse(BaseModel):
+    secret: str
+    otpauth_uri: str
+
+
+class TotpStatusResponse(BaseModel):
+    enabled: bool

@@ -7,12 +7,19 @@ from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pyotp
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.auth import routes, security, tokens
 from app.auth.deps import get_auth_db
-from app.models import AuthEvent, RefreshToken, User, UserCredential
+from app.models import (
+    AuthEvent,
+    RefreshToken,
+    User,
+    UserCredential,
+    UserTotpSecret,
+)
 from database import get_test_engine
 
 
@@ -57,6 +64,7 @@ class AuthRouteTests(unittest.TestCase):
                 "user_credentials",
                 "refresh_tokens",
                 "auth_events",
+                "user_totp_secrets",
             )
         }
 
@@ -134,6 +142,7 @@ class AuthRouteTests(unittest.TestCase):
             json={
                 "email": f"  {self.email.upper()} ",
                 "password": "long-enough-test-password",
+                "totp_code": "ignored-when-mfa-is-disabled",
             },
         )
 
@@ -481,6 +490,14 @@ class AuthRouteTests(unittest.TestCase):
             ("GET", "/auth/sessions"),
             ("POST", f"/auth/sessions/{session_id}/revoke"),
             ("POST", "/auth/logout-all"),
+            ("POST", "/auth/mfa/setup"),
+            ("POST", "/auth/mfa/verify", {"code": "123456"}),
+            ("GET", "/auth/mfa/status"),
+            (
+                "POST",
+                "/auth/mfa/disable",
+                {"password": "long-enough-test-password", "code": "123456"},
+            ),
             (
                 "POST",
                 "/auth/change-password",
@@ -750,6 +767,207 @@ class AuthRouteTests(unittest.TestCase):
                 }
             )
         )
+
+    def _login_and_get_headers(self, password="long-enough-test-password"):
+        login = self.client.post(
+            "/auth/login",
+            json={"email": self.email, "password": password},
+        )
+        self.assertEqual(login.status_code, 200, login.text)
+        return {
+            "Authorization": f"Bearer {login.json()['access_token']}"
+        }
+
+    def _enable_mfa(self):
+        headers = self._login_and_get_headers()
+        setup = self.client.post("/auth/mfa/setup", headers=headers)
+        self.assertEqual(setup.status_code, 200, setup.text)
+        secret = setup.json()["secret"]
+        code = pyotp.TOTP(secret).now()
+        enabled = self.client.post(
+            "/auth/mfa/verify",
+            headers=headers,
+            json={"code": code},
+        )
+        self.assertEqual(enabled.status_code, 204, enabled.text)
+        return headers, secret
+
+    def test_mfa_setup_verify_status_and_audit_events(self):
+        credential = self._create_user()
+        headers = self._login_and_get_headers()
+
+        status_before = self.client.get("/auth/mfa/status", headers=headers)
+        self.assertEqual(status_before.status_code, 200)
+        self.assertEqual(status_before.json(), {"enabled": False})
+
+        setup = self.client.post("/auth/mfa/setup", headers=headers)
+        self.assertEqual(setup.status_code, 200, setup.text)
+        secret = setup.json()["secret"]
+        self.assertEqual(setup.json()["otpauth_uri"], pyotp.TOTP(secret).provisioning_uri(
+            name=self.email,
+            issuer_name="BFAMS-DeFi",
+        ))
+        self.assertEqual(pyotp.parse_uri(setup.json()["otpauth_uri"]).secret, secret)
+        self.assertFalse(
+            self.db.get(UserTotpSecret, credential.user_id).enabled
+        )
+
+        invalid = self.client.post(
+            "/auth/mfa/verify",
+            headers=headers,
+            json={"code": "not-a-code"},
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertNotIn(secret, invalid.text)
+
+        valid = self.client.post(
+            "/auth/mfa/verify",
+            headers=headers,
+            json={"code": pyotp.TOTP(secret).now()},
+        )
+        self.assertEqual(valid.status_code, 204)
+        status_after = self.client.get("/auth/mfa/status", headers=headers)
+        self.assertEqual(status_after.json(), {"enabled": True})
+        self.assertNotIn(secret, status_after.text)
+        sessions = self.client.get("/auth/sessions", headers=headers)
+        self.assertEqual(sessions.status_code, 200)
+        self.assertNotIn(secret, sessions.text)
+
+        event_types = set(
+            self.db.scalars(
+                select(AuthEvent.event_type).where(
+                    AuthEvent.user_id == credential.user_id
+                )
+            ).all()
+        )
+        self.assertIn("mfa_enabled", event_types)
+        self.assertNotIn(secret, str(event_types))
+
+    def test_mfa_disable_requires_password_and_valid_totp(self):
+        credential = self._create_user()
+        headers, secret = self._enable_mfa()
+        code = pyotp.TOTP(secret).now()
+
+        wrong_password = self.client.post(
+            "/auth/mfa/disable",
+            headers=headers,
+            json={"password": "wrong-password", "code": code},
+        )
+        self.assertEqual(wrong_password.status_code, 400)
+        wrong_code = self.client.post(
+            "/auth/mfa/disable",
+            headers=headers,
+            json={
+                "password": "long-enough-test-password",
+                "code": "000000" if code != "000000" else "999999",
+            },
+        )
+        self.assertEqual(wrong_code.status_code, 400)
+        self.assertTrue(self.db.get(UserTotpSecret, credential.user_id).enabled)
+
+        disabled = self.client.post(
+            "/auth/mfa/disable",
+            headers=headers,
+            json={
+                "password": "long-enough-test-password",
+                "code": pyotp.TOTP(secret).now(),
+            },
+        )
+        self.assertEqual(disabled.status_code, 204, disabled.text)
+        self.assertEqual(
+            self.client.get("/auth/mfa/status", headers=headers).json(),
+            {"enabled": False},
+        )
+        event_types = set(
+            self.db.scalars(
+                select(AuthEvent.event_type).where(
+                    AuthEvent.user_id == credential.user_id
+                )
+            ).all()
+        )
+        self.assertIn("mfa_disabled", event_types)
+
+    def test_mfa_login_requires_code_with_indistinguishable_failures(self):
+        self._create_user()
+        _, secret = self._enable_mfa()
+
+        attempts = [
+            {"email": f"{uuid.uuid4()}@example.test", "password": "wrong-password"},
+            {"email": self.email, "password": "wrong-password"},
+            {"email": self.email, "password": "long-enough-test-password"},
+            {
+                "email": self.email,
+                "password": "long-enough-test-password",
+                "totp_code": "000000",
+            },
+        ]
+        failures = [
+            self.client.post("/auth/login", json=attempt)
+            for attempt in attempts
+        ]
+        self.assertTrue(
+            all(
+                response.status_code == 401
+                and response.json() == {"detail": "invalid credentials"}
+                for response in failures
+            )
+        )
+        self.assertTrue(all(secret not in response.text for response in failures))
+        successful = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "long-enough-test-password",
+                "totp_code": pyotp.TOTP(secret).now(),
+            },
+        )
+        self.assertEqual(successful.status_code, 200, successful.text)
+        self.assertNotIn(secret, successful.text)
+
+    def test_password_change_keeps_mfa_enabled(self):
+        self._create_user()
+        headers, secret = self._enable_mfa()
+        changed = self.client.post(
+            "/auth/change-password",
+            headers=headers,
+            json={
+                "current_password": "long-enough-test-password",
+                "new_password": "brand-new-long-password",
+            },
+        )
+        self.assertEqual(changed.status_code, 204)
+        self.assertEqual(
+            self.client.get("/auth/mfa/status", headers=headers).status_code,
+            401,
+        )
+        row = self.db.scalar(
+            select(UserTotpSecret).where(
+                UserTotpSecret.user_id == self.db.scalar(
+                    select(UserCredential.user_id).where(
+                        UserCredential.email == self.email
+                    )
+                )
+            )
+        )
+        self.assertIsNotNone(row)
+        self.assertTrue(row.enabled)
+        login_without_code = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "brand-new-long-password",
+            },
+        )
+        self.assertEqual(login_without_code.status_code, 401)
+        login_with_code = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "brand-new-long-password",
+                "totp_code": pyotp.TOTP(secret).now(),
+            },
+        )
+        self.assertEqual(login_with_code.status_code, 200)
 
     def test_refresh_and_logout_enforce_request_protection(self):
         missing_header = self.client.post("/auth/refresh")

@@ -343,6 +343,24 @@ class UserCredential(Base):
     )
 
 
+class UserTotpSecret(Base):
+    __tablename__ = "user_totp_secrets"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), primary_key=True
+    )
+    secret: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[bool] = mapped_column(
+        nullable=False,
+        server_default=text("false"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
 class RefreshToken(Base):
     __tablename__ = "refresh_tokens"
 
@@ -373,7 +391,8 @@ class AuthEvent(Base):
     __table_args__ = (
         CheckConstraint(
             "event_type IN ('register', 'login_success', 'login_failed', 'locked', "
-            "'refresh', 'refresh_reuse_detected', 'logout', 'password_changed')",
+            "'refresh', 'refresh_reuse_detected', 'logout', 'password_changed', "
+            "'mfa_enabled', 'mfa_disabled')",
             name="auth_events_event_type_check",
         ),
         Index(

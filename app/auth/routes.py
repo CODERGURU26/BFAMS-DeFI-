@@ -11,17 +11,28 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import config, security, tokens
+from app.auth import totp as totp_security
 from app.auth.config import AuthConfigurationError
 from app.auth.deps import assert_auth_database, get_auth_db, get_current_user
 from app.auth.schemas import (
     CredentialsRequest,
     PasswordChangeRequest,
     RegistrationResponse,
+    TotpCodeRequest,
+    TotpDisableRequest,
+    TotpSetupResponse,
+    TotpStatusResponse,
     TokenResponse,
     UserResponse,
     is_valid_email,
 )
-from app.models import AuthEvent, RefreshToken, User, UserCredential
+from app.models import (
+    AuthEvent,
+    RefreshToken,
+    User,
+    UserCredential,
+    UserTotpSecret,
+)
 
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -39,6 +50,8 @@ _ALLOWED_AUTH_EVENTS = {
     "refresh_reuse_detected",
     "logout",
     "password_changed",
+    "mfa_enabled",
+    "mfa_disabled",
 }
 
 
@@ -187,10 +200,20 @@ def login(
     currently_locked = (
         credential.locked_until is not None and credential.locked_until > now
     )
+    totp_configuration = None
+    totp_valid = True
+    if valid_password and credential.is_active and not currently_locked:
+        totp_configuration = db.get(UserTotpSecret, credential.user_id)
+        if totp_configuration is not None and totp_configuration.enabled:
+            totp_valid = totp_security.verify_totp_code(
+                totp_configuration.secret,
+                body.totp_code,
+            )
     if (
         not credential.is_active
         or currently_locked
         or not valid_password
+        or not totp_valid
     ):
         _record_login_failure(request, now)
         _record_event(db, "login_failed", credential.user_id)
@@ -492,6 +515,122 @@ def change_password(
     )
     response.status_code = status.HTTP_204_NO_CONTENT
     return response
+
+
+@router.post("/mfa/setup", response_model=TotpSetupResponse)
+def setup_mfa(
+    current_user: UserResponse = Depends(get_current_user),
+    db: Session = Depends(get_auth_db),
+) -> TotpSetupResponse:
+    assert_auth_database(db)
+    db.execute(
+        select(User.id)
+        .where(User.id == current_user.user_id)
+        .with_for_update()
+    ).scalar_one()
+    configuration = db.execute(
+        select(UserTotpSecret)
+        .where(UserTotpSecret.user_id == current_user.user_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if configuration is not None and configuration.enabled:
+        raise HTTPException(status_code=409, detail="MFA is already enabled.")
+
+    secret = totp_security.generate_totp_secret()
+    if configuration is None:
+        configuration = UserTotpSecret(
+            user_id=current_user.user_id,
+            secret=secret,
+            enabled=False,
+        )
+        db.add(configuration)
+    else:
+        configuration.secret = secret
+    db.commit()
+    return TotpSetupResponse(
+        secret=secret,
+        otpauth_uri=totp_security.create_totp_uri(secret, current_user.email),
+    )
+
+
+@router.post("/mfa/verify", status_code=status.HTTP_204_NO_CONTENT)
+def verify_mfa(
+    body: TotpCodeRequest,
+    current_user: UserResponse = Depends(get_current_user),
+    db: Session = Depends(get_auth_db),
+) -> Response:
+    assert_auth_database(db)
+    configuration = db.execute(
+        select(UserTotpSecret)
+        .where(UserTotpSecret.user_id == current_user.user_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if (
+        configuration is None
+        or configuration.enabled
+        or not totp_security.verify_totp_code(configuration.secret, body.code)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid verification code.")
+
+    configuration.enabled = True
+    _record_event(db, "mfa_enabled", current_user.user_id)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/mfa/status", response_model=TotpStatusResponse)
+def mfa_status(
+    current_user: UserResponse = Depends(get_current_user),
+    db: Session = Depends(get_auth_db),
+) -> TotpStatusResponse:
+    assert_auth_database(db)
+    configuration = db.get(UserTotpSecret, current_user.user_id)
+    return TotpStatusResponse(
+        enabled=configuration is not None and configuration.enabled
+    )
+
+
+@router.post("/mfa/disable", status_code=status.HTTP_204_NO_CONTENT)
+def disable_mfa(
+    body: TotpDisableRequest,
+    current_user: UserResponse = Depends(get_current_user),
+    db: Session = Depends(get_auth_db),
+) -> Response:
+    assert_auth_database(db)
+    credential = db.execute(
+        select(UserCredential)
+        .where(
+            UserCredential.user_id == current_user.user_id,
+            UserCredential.is_active.is_(True),
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    configuration = db.execute(
+        select(UserTotpSecret)
+        .where(
+            UserTotpSecret.user_id == current_user.user_id,
+            UserTotpSecret.enabled.is_(True),
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if (
+        credential is None
+        or configuration is None
+        or not security.verify_password(
+            body.password,
+            credential.password_hash,
+        )[0]
+        or not totp_security.verify_totp_code(
+            configuration.secret,
+            body.code,
+        )
+    ):
+        raise HTTPException(status_code=400, detail="MFA verification failed.")
+
+    configuration.enabled = False
+    _record_event(db, "mfa_disabled", current_user.user_id)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post(

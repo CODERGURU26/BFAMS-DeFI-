@@ -33,6 +33,10 @@ All routes use the `/auth` prefix.
 | `POST` | `/auth/sessions/{session_id}/revoke` | Revoke one owned session family |
 | `POST` | `/auth/logout-all` | Revoke all refresh-token sessions for the authenticated user |
 | `POST` | `/auth/change-password` | Verify and replace the password; revoke all refresh sessions |
+| `POST` | `/auth/mfa/setup` | Create a pending TOTP authenticator configuration |
+| `POST` | `/auth/mfa/verify` | Verify and enable a pending TOTP configuration |
+| `GET` | `/auth/mfa/status` | Return whether TOTP MFA is enabled |
+| `POST` | `/auth/mfa/disable` | Verify password and TOTP code, then disable MFA |
 | `GET` | `/auth/me` | Return the authenticated user's ID and email |
 | `POST` | `/auth/register` | Create a user and credential when registration is enabled |
 
@@ -59,6 +63,11 @@ revokes the associated token family. Changing a password invalidates access
 tokens issued before the recorded password-change time. Authentication audit
 events contain only user references, event types, and timestamps; authentication
 secrets and credential values are not event fields.
+
+TOTP MFA is optional. When enabled, login requires the password and a six-digit
+RFC 6238 code in a 30-second acceptance window. Setup returns the secret and
+provisioning URI once; the secret is retained in the `user_totp_secrets` table.
+Password changes and logout do not disable MFA.
 
 Authentication is not authorization: this phase intentionally does not attach
 the user dependency to unrelated routes.
