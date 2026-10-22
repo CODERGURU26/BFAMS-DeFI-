@@ -8,10 +8,11 @@ from unittest.mock import patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pyotp
+from cryptography.fernet import Fernet
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from app.auth import routes, security, tokens
+from app.auth import crypto, routes, security, tokens
 from app.auth.deps import get_auth_db
 from app.models import (
     AuthEvent,
@@ -83,12 +84,14 @@ class AuthRouteTests(unittest.TestCase):
         with routes._LOGIN_FAILURES_LOCK:
             routes._LOGIN_FAILURES_BY_IP.clear()
         self.secret = "route-test-secret-that-is-long-enough"
+        self.totp_encryption_key = Fernet.generate_key().decode("ascii")
         self.environment = patch.dict(
             os.environ,
             {
                 "AUTH_JWT_SECRET": self.secret,
                 "AUTH_REGISTRATION_ENABLED": "false",
                 "AUTH_COOKIE_SECURE": "true",
+                "AUTH_TOTP_ENCRYPTION_KEY": self.totp_encryption_key,
             },
         )
         self.environment.start()
@@ -811,6 +814,16 @@ class AuthRouteTests(unittest.TestCase):
         self.assertFalse(
             self.db.get(UserTotpSecret, credential.user_id).enabled
         )
+        stored_secret = self.db.get(UserTotpSecret, credential.user_id).secret
+        self.assertNotEqual(stored_secret, secret)
+        self.assertEqual(crypto.decrypt_totp_secret(stored_secret), secret)
+        self.assertNotIn(secret, stored_secret)
+        self.assertFalse(
+            routes.totp_security.verify_totp_code(
+                stored_secret,
+                pyotp.TOTP(secret).now(),
+            )
+        )
 
         invalid = self.client.post(
             "/auth/mfa/verify",
@@ -842,6 +855,130 @@ class AuthRouteTests(unittest.TestCase):
         )
         self.assertIn("mfa_enabled", event_types)
         self.assertNotIn(secret, str(event_types))
+
+    def test_totp_encryption_roundtrip_and_key_validation(self):
+        plaintext = pyotp.random_base32()
+        ciphertext = crypto.encrypt_totp_secret(plaintext)
+        self.assertNotEqual(ciphertext, plaintext)
+        self.assertEqual(crypto.decrypt_totp_secret(ciphertext), plaintext)
+        self.assertTrue(routes.config.mfa_encryption_available())
+
+        for key in ("", "invalid-key", Fernet.generate_key().decode("ascii")):
+            with patch.dict(os.environ, {"AUTH_TOTP_ENCRYPTION_KEY": key}):
+                self.assertEqual(
+                    routes.config.mfa_encryption_available(),
+                    bool(key) and key != "invalid-key",
+                )
+                if key == "invalid-key" or key == "":
+                    with self.assertRaises(routes.AuthConfigurationError):
+                        routes.config.get_totp_encryption_key()
+        wrong_key = Fernet.generate_key().decode("ascii")
+        with patch.dict(
+            os.environ,
+            {"AUTH_TOTP_ENCRYPTION_KEY": wrong_key},
+        ):
+            with self.assertRaises(routes.AuthConfigurationError):
+                crypto.decrypt_totp_secret(ciphertext)
+        with self.assertRaises(routes.AuthConfigurationError):
+            crypto.decrypt_totp_secret(ciphertext[:-2] + "xx")
+
+    def test_missing_or_invalid_encryption_key_fails_closed(self):
+        self._create_user()
+        headers = self._login_and_get_headers()
+
+        for key in ("", "invalid-key"):
+            with patch.dict(os.environ, {"AUTH_TOTP_ENCRYPTION_KEY": key}):
+                setup = self.client.post("/auth/mfa/setup", headers=headers)
+                verify = self.client.post(
+                    "/auth/mfa/verify",
+                    headers=headers,
+                    json={"code": "123456"},
+                )
+                disable = self.client.post(
+                    "/auth/mfa/disable",
+                    headers=headers,
+                    json={"password": "long-enough-test-password", "code": "123456"},
+                )
+            self.assertEqual(setup.status_code, 503)
+            self.assertEqual(verify.status_code, 503)
+            self.assertEqual(disable.status_code, 503)
+
+    def test_plaintext_secret_upgrades_after_successful_login_verification(self):
+        credential = self._create_user()
+        _, secret = self._enable_mfa()
+        configuration = self.db.get(UserTotpSecret, credential.user_id)
+        configuration.secret = secret
+        self.db.flush()
+
+        response = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "long-enough-test-password",
+                "totp_code": pyotp.TOTP(secret).now(),
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.db.refresh(configuration)
+        self.assertNotEqual(configuration.secret, secret)
+        self.assertEqual(crypto.decrypt_totp_secret(configuration.secret), secret)
+
+    def test_plaintext_secret_upgrades_after_successful_setup_verification(self):
+        credential = self._create_user()
+        headers = self._login_and_get_headers()
+        setup = self.client.post("/auth/mfa/setup", headers=headers)
+        secret = setup.json()["secret"]
+        configuration = self.db.get(UserTotpSecret, credential.user_id)
+        configuration.secret = secret
+        self.db.flush()
+
+        response = self.client.post(
+            "/auth/mfa/verify",
+            headers=headers,
+            json={"code": pyotp.TOTP(secret).now()},
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.db.refresh(configuration)
+        self.assertNotEqual(configuration.secret, secret)
+        self.assertEqual(crypto.decrypt_totp_secret(configuration.secret), secret)
+
+    def test_corrupted_ciphertext_fails_mfa_login_safely(self):
+        credential = self._create_user()
+        _, secret = self._enable_mfa()
+        configuration = self.db.get(UserTotpSecret, credential.user_id)
+        configuration.secret = "gAAAAA-corrupted-ciphertext"
+        self.db.flush()
+
+        response = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "long-enough-test-password",
+                "totp_code": pyotp.TOTP(secret).now(),
+            },
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"detail": "invalid credentials"})
+        self.assertNotIn(configuration.secret, response.text)
+
+    def test_missing_key_does_not_disable_mfa_login(self):
+        self._create_user()
+        _, secret = self._enable_mfa()
+        with patch.dict(os.environ, {"AUTH_TOTP_ENCRYPTION_KEY": ""}):
+            response = self.client.post(
+                "/auth/login",
+                json={
+                    "email": self.email,
+                    "password": "long-enough-test-password",
+                    "totp_code": pyotp.TOTP(secret).now(),
+                },
+            )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"detail": "invalid credentials"})
+        self.assertNotIn(secret, response.text)
 
     def test_mfa_disable_requires_password_and_valid_totp(self):
         credential = self._create_user()

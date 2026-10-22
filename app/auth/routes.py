@@ -1,5 +1,6 @@
 """Email/password authentication routes."""
 
+import re
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import config, security, tokens
+from app.auth import crypto as totp_crypto
 from app.auth import totp as totp_security
 from app.auth.config import AuthConfigurationError
 from app.auth.deps import assert_auth_database, get_auth_db, get_current_user
@@ -41,6 +43,7 @@ _DUMMY_PASSWORD_HASH = security.PASSWORD_HASHER.hash("auth-timing-normalization"
 _LOGIN_FAILURES_BY_IP: dict[str, deque[datetime]] = defaultdict(deque)
 _LOGIN_FAILURES_LOCK = Lock()
 _LOGIN_RATE_LIMITS = ((5, timedelta(minutes=1)), (20, timedelta(hours=1)))
+_LEGACY_TOTP_SECRET = re.compile(r"^[A-Z2-7]{16,}$")
 _ALLOWED_AUTH_EVENTS = {
     "register",
     "login_success",
@@ -67,6 +70,23 @@ def _ensure_configured() -> None:
             status_code=503,
             detail="Authentication is not configured.",
         ) from None
+
+
+def _require_mfa_encryption() -> None:
+    try:
+        config.get_totp_encryption_key()
+    except AuthConfigurationError:
+        raise HTTPException(
+            status_code=503,
+            detail="MFA encryption is not configured.",
+        ) from None
+
+
+def _load_totp_secret(configuration: UserTotpSecret) -> tuple[str, bool]:
+    stored_value = configuration.secret
+    if _LEGACY_TOTP_SECRET.fullmatch(stored_value):
+        return stored_value, True
+    return totp_crypto.decrypt_totp_secret(stored_value), False
 
 
 def _record_event(
@@ -205,10 +225,18 @@ def login(
     if valid_password and credential.is_active and not currently_locked:
         totp_configuration = db.get(UserTotpSecret, credential.user_id)
         if totp_configuration is not None and totp_configuration.enabled:
-            totp_valid = totp_security.verify_totp_code(
-                totp_configuration.secret,
-                body.totp_code,
-            )
+            try:
+                secret, is_legacy = _load_totp_secret(totp_configuration)
+                totp_valid = totp_security.verify_totp_code(
+                    secret,
+                    body.totp_code,
+                )
+                if totp_valid and is_legacy:
+                    totp_configuration.secret = totp_crypto.encrypt_totp_secret(
+                        secret
+                    )
+            except AuthConfigurationError:
+                totp_valid = False
     if (
         not credential.is_active
         or currently_locked
@@ -523,6 +551,7 @@ def setup_mfa(
     db: Session = Depends(get_auth_db),
 ) -> TotpSetupResponse:
     assert_auth_database(db)
+    _require_mfa_encryption()
     db.execute(
         select(User.id)
         .where(User.id == current_user.user_id)
@@ -537,15 +566,16 @@ def setup_mfa(
         raise HTTPException(status_code=409, detail="MFA is already enabled.")
 
     secret = totp_security.generate_totp_secret()
+    encrypted_secret = totp_crypto.encrypt_totp_secret(secret)
     if configuration is None:
         configuration = UserTotpSecret(
             user_id=current_user.user_id,
-            secret=secret,
+            secret=encrypted_secret,
             enabled=False,
         )
         db.add(configuration)
     else:
-        configuration.secret = secret
+        configuration.secret = encrypted_secret
     db.commit()
     return TotpSetupResponse(
         secret=secret,
@@ -560,18 +590,26 @@ def verify_mfa(
     db: Session = Depends(get_auth_db),
 ) -> Response:
     assert_auth_database(db)
+    _require_mfa_encryption()
     configuration = db.execute(
         select(UserTotpSecret)
         .where(UserTotpSecret.user_id == current_user.user_id)
         .with_for_update()
     ).scalar_one_or_none()
-    if (
-        configuration is None
-        or configuration.enabled
-        or not totp_security.verify_totp_code(configuration.secret, body.code)
-    ):
+    if configuration is None or configuration.enabled:
+        raise HTTPException(status_code=400, detail="Invalid verification code.")
+    try:
+        secret, is_legacy = _load_totp_secret(configuration)
+    except AuthConfigurationError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid verification code.",
+        ) from None
+    if not totp_security.verify_totp_code(secret, body.code):
         raise HTTPException(status_code=400, detail="Invalid verification code.")
 
+    if is_legacy:
+        configuration.secret = totp_crypto.encrypt_totp_secret(secret)
     configuration.enabled = True
     _record_event(db, "mfa_enabled", current_user.user_id)
     db.commit()
@@ -597,6 +635,7 @@ def disable_mfa(
     db: Session = Depends(get_auth_db),
 ) -> Response:
     assert_auth_database(db)
+    _require_mfa_encryption()
     credential = db.execute(
         select(UserCredential)
         .where(
@@ -620,13 +659,20 @@ def disable_mfa(
             body.password,
             credential.password_hash,
         )[0]
-        or not totp_security.verify_totp_code(
-            configuration.secret,
-            body.code,
-        )
     ):
         raise HTTPException(status_code=400, detail="MFA verification failed.")
 
+    try:
+        secret, is_legacy = _load_totp_secret(configuration)
+    except AuthConfigurationError:
+        raise HTTPException(
+            status_code=400,
+            detail="MFA verification failed.",
+        ) from None
+    if not totp_security.verify_totp_code(secret, body.code):
+        raise HTTPException(status_code=400, detail="MFA verification failed.")
+    if is_legacy:
+        configuration.secret = totp_crypto.encrypt_totp_secret(secret)
     configuration.enabled = False
     _record_event(db, "mfa_disabled", current_user.user_id)
     db.commit()

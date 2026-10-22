@@ -1,5 +1,6 @@
 """RFC 6238 TOTP helpers."""
 
+import binascii
 import re
 
 import pyotp
@@ -25,4 +26,7 @@ def verify_totp_code(secret: str, code: str | None) -> bool:
     if code is None or _CODE_PATTERN.fullmatch(code) is None:
         return False
     totp = pyotp.TOTP(secret, interval=_TOTP_INTERVAL_SECONDS, digits=6)
-    return totp.verify(code, valid_window=_TOTP_VALID_WINDOW)
+    try:
+        return totp.verify(code, valid_window=_TOTP_VALID_WINDOW)
+    except (binascii.Error, ValueError):
+        return False

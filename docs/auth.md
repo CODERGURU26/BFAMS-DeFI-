@@ -17,6 +17,7 @@ Without a valid secret, login, refresh, and registration fail closed with HTTP
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `AUTH_JWT_SECRET` | unset | HS256 signing secret; at least 32 characters |
+| `AUTH_TOTP_ENCRYPTION_KEY` | unset | Fernet key used to encrypt TOTP secrets at rest; required for MFA operations |
 | `AUTH_REGISTRATION_ENABLED` | `false` | Set to `true` to enable registration |
 | `AUTH_COOKIE_SECURE` | `true` | Controls the refresh cookie's `Secure` flag |
 
@@ -66,8 +67,12 @@ secrets and credential values are not event fields.
 
 TOTP MFA is optional. When enabled, login requires the password and a six-digit
 RFC 6238 code in a 30-second acceptance window. Setup returns the secret and
-provisioning URI once; the secret is retained in the `user_totp_secrets` table.
-Password changes and logout do not disable MFA.
+provisioning URI once; the encrypted secret is retained in the
+`user_totp_secrets` table. Configure `AUTH_TOTP_ENCRYPTION_KEY` with a valid
+Fernet key independent of `AUTH_JWT_SECRET`; generate and protect the key
+outside the application. Existing plaintext Base32 secrets are encrypted after
+their first successful MFA verification. Password changes and logout do not
+disable MFA.
 
 Authentication is not authorization: this phase intentionally does not attach
 the user dependency to unrelated routes.
