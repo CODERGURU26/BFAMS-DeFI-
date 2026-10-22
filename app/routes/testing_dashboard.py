@@ -11,18 +11,17 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.dependencies import get_mf_db
+from app.auth.deps import get_current_user
+from app.auth.schemas import UserResponse
 from app.models import (
-    DataProvider,
     DataSyncRun,
     FinancialAccount,
     FinancialConnection,
-    FinancialInstitution,
     InvestmentHolding,
     MfNav,
     MfScheme,
     SecurityDailyPrice,
     Transaction,
-    User,
 )
 from app.demat_ingestion import _is_valid_isin, value_equity_holding
 from app.mf_valuation import value_investment_holding_record
@@ -302,7 +301,7 @@ def _comparable_snapshot_change(
     }
 
 
-def _dashboard_data(session: Session) -> dict:
+def _dashboard_data(session: Session, user_id) -> dict:
     database_name = session.scalar(text("SELECT current_database()"))
     if database_name != "BFAMS-DeFI-test":
         raise HTTPException(
@@ -310,22 +309,51 @@ def _dashboard_data(session: Session) -> dict:
             detail="Testing dashboard requires BFAMS-DeFI-test.",
         )
 
+    owned_accounts = (
+        select(FinancialAccount.id)
+        .join(
+            FinancialConnection,
+            FinancialConnection.id == FinancialAccount.connection_id,
+        )
+        .where(FinancialConnection.user_id == user_id)
+    )
     account = session.scalars(
-        select(FinancialAccount).where(
-            FinancialAccount.external_account_id == "DHAN-DEMAT-1"
+        select(FinancialAccount)
+        .join(
+            FinancialConnection,
+            FinancialConnection.id == FinancialAccount.connection_id,
+        )
+        .where(
+            FinancialConnection.user_id == user_id,
+            FinancialAccount.external_account_id == "DHAN-DEMAT-1",
         )
     ).first()
     counts = {
-        "users": session.scalar(select(func.count()).select_from(User)),
-        "accounts": session.scalar(select(func.count()).select_from(FinancialAccount)),
-        "transactions": session.scalar(select(func.count()).select_from(Transaction)),
-        "holdings": session.scalar(
-            select(func.count()).select_from(InvestmentHolding)
+        "accounts": session.scalar(
+            select(func.count()).select_from(FinancialAccount).where(
+                FinancialAccount.id.in_(owned_accounts)
+            )
         ),
-        "sync_runs": session.scalar(select(func.count()).select_from(DataSyncRun)),
-        "providers": session.scalar(select(func.count()).select_from(DataProvider)),
-        "institutions": session.scalar(
-            select(func.count()).select_from(FinancialInstitution)
+        "transactions": session.scalar(
+            select(func.count())
+            .select_from(Transaction)
+            .where(Transaction.account_id.in_(owned_accounts))
+        ),
+        "holdings": session.scalar(
+            select(func.count())
+            .select_from(InvestmentHolding)
+            .where(InvestmentHolding.account_id.in_(owned_accounts))
+        ),
+        "sync_runs": session.scalar(
+            select(func.count())
+            .select_from(DataSyncRun)
+            .where(
+                DataSyncRun.connection_id.in_(
+                    select(FinancialConnection.id).where(
+                        FinancialConnection.user_id == user_id
+                    )
+                )
+            )
         ),
         "mutual_fund_schemes": session.scalar(
             select(func.count()).select_from(MfScheme)
@@ -624,8 +652,11 @@ def dashboard():
 
 
 @router.get("/data")
-def dashboard_data(session: Session = Depends(get_mf_db)):
-    return _dashboard_data(session)
+def dashboard_data(
+    current_user: UserResponse = Depends(get_current_user),
+    session: Session = Depends(get_mf_db),
+):
+    return _dashboard_data(session, current_user.user_id)
 
 
 _DASHBOARD_HTML = """<!doctype html>

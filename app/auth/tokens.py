@@ -88,14 +88,13 @@ def decode_access_token(
         raise AccessTokenError("Invalid access token.")
     if password_changed_at is not None:
         changed_at = _utc_now(password_changed_at)
-        try:
-            issued_at = datetime.fromtimestamp(
-                float(claims["iat"]),
-                tz=timezone.utc,
-            )
-        except (OverflowError, TypeError, ValueError) as exc:
-            raise AccessTokenError("Invalid access token.") from exc
-        if issued_at < changed_at:
+        issued_at = claims.get("iat")
+        if (
+            isinstance(issued_at, bool)
+            or not isinstance(issued_at, (int, float))
+            or not math.isfinite(issued_at)
+            or math.floor(issued_at) < math.floor(changed_at.timestamp())
+        ):
             raise AccessTokenError("Invalid access token.")
     return claims
 

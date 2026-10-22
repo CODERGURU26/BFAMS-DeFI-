@@ -42,6 +42,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from app.auth.authorization import get_owned_account
+from app.auth.deps import get_current_user
+from app.auth.schemas import UserResponse
 from app.dependencies import get_mf_db
 from app.models import (
     DataProvider,
@@ -169,17 +172,6 @@ class DhanLiveValuationResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _get_account(session: Session, account_id: uuid.UUID) -> FinancialAccount:
-    """Raise 404 if account does not exist."""
-    acc = session.get(FinancialAccount, account_id)
-    if acc is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Financial account {account_id} not found.",
-        )
-    return acc
-
-
 def _verify_test_db(session: Session) -> None:
     """Abort if not connected to the test database."""
     db_name = session.execute(text("SELECT current_database()")).scalar()
@@ -190,7 +182,10 @@ def _verify_test_db(session: Session) -> None:
         )
 
 
-def _get_dhan_account(session: Session) -> FinancialAccount:
+def _get_dhan_account(
+    session: Session,
+    user_id: uuid.UUID,
+) -> FinancialAccount:
     accounts = session.scalars(
         select(FinancialAccount)
         .join(
@@ -201,12 +196,13 @@ def _get_dhan_account(session: Session) -> FinancialAccount:
         .where(
             FinancialAccount.external_account_id == "DHAN-DEMAT-1",
             DataProvider.provider_code == "dhan_manual",
+            FinancialConnection.user_id == user_id,
         )
     ).all()
     if len(accounts) != 1:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Configured Dhan TEST account is unavailable or ambiguous.",
+            detail="Resource not found.",
         )
     return accounts[0]
 
@@ -307,12 +303,12 @@ def _validate_local_dhan_request(request: Request) -> None:
 def sync_dhan_holdings(
     request: Request,
     dry_run: bool = Query(True, description="Fetch and validate without writing"),
+    current_user: UserResponse = Depends(get_current_user),
     session: Session = Depends(get_mf_db),
 ) -> DhanSyncResponse:
-    _validate_local_dhan_request(request)
-
     _verify_test_db(session)
-    account = _get_dhan_account(session)
+    account = _get_dhan_account(session, current_user.user_id)
+    _validate_local_dhan_request(request)
 
     cooldown_start = datetime.now(timezone.utc) - timedelta(seconds=60)
     recent_sync = session.scalar(
@@ -385,11 +381,12 @@ def sync_dhan_holdings(
 )
 def get_dhan_live_valuation(
     request: Request,
+    current_user: UserResponse = Depends(get_current_user),
     session: Session = Depends(get_mf_db),
 ) -> DhanLiveValuationResponse:
-    _validate_local_dhan_request(request)
     _verify_test_db(session)
-    _get_dhan_account(session)
+    _get_dhan_account(session, current_user.user_id)
+    _validate_local_dhan_request(request)
 
     try:
         with DhanClient.from_environment() as client:
@@ -483,10 +480,11 @@ async def ingest_holdings(
     ),
     dry_run: bool = Query(False, description="Validate without writing to database"),
     file: UploadFile = File(..., description="Dhan Holdings CSV file"),
+    current_user: UserResponse = Depends(get_current_user),
     session: Session = Depends(get_mf_db),
 ) -> IngestionResponse:
     _verify_test_db(session)
-    _get_account(session, account_id)
+    get_owned_account(session, account_id, current_user.user_id)
 
     csv_bytes = await file.read()
     try:
@@ -524,10 +522,11 @@ async def ingest_trades(
     account_id: uuid.UUID = Query(..., description="Target financial account UUID"),
     dry_run: bool = Query(False, description="Validate without writing to database"),
     file: UploadFile = File(..., description="Dhan Past Trades CSV file"),
+    current_user: UserResponse = Depends(get_current_user),
     session: Session = Depends(get_mf_db),
 ) -> IngestionResponse:
     _verify_test_db(session)
-    _get_account(session, account_id)
+    get_owned_account(session, account_id, current_user.user_id)
 
     csv_bytes = await file.read()
     try:
@@ -558,10 +557,11 @@ async def ingest_trades(
 )
 def get_holdings(
     account_id: uuid.UUID,
+    current_user: UserResponse = Depends(get_current_user),
     session: Session = Depends(get_mf_db),
 ) -> List[HoldingRow]:
     _verify_test_db(session)
-    _get_account(session, account_id)
+    get_owned_account(session, account_id, current_user.user_id)
 
     # Find most recent snapshot timestamp
     latest_ts = session.scalars(
@@ -626,10 +626,11 @@ def get_valuation(
         le=30,
         description="Maximum acceptable price age in days",
     ),
+    current_user: UserResponse = Depends(get_current_user),
     session: Session = Depends(get_mf_db),
 ) -> PortfolioValuationResponse:
     _verify_test_db(session)
-    _get_account(session, account_id)
+    get_owned_account(session, account_id, current_user.user_id)
 
     summary = get_portfolio_valuation(
         session=session,

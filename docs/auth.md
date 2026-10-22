@@ -1,7 +1,6 @@
 # Authentication
 
-Phase 1 provides email/password authentication. Existing application routes are
-not protected by this phase.
+Email/password authentication and Phase 2 ownership authorization are enabled.
 
 ## Setup
 
@@ -51,7 +50,24 @@ revokes the associated token family. Changing a password invalidates access
 tokens issued before the recorded password-change time.
 
 Authentication is not authorization: this phase intentionally does not attach
-the user dependency to existing application routes.
+the user dependency to unrelated routes.
+
+## Authorization
+
+Private account, connection, transaction, portfolio, dashboard-data, and Setu
+routes require a bearer access token. Account and connection lists are filtered
+in the database by the authenticated user. Transactions and holdings are
+filtered through their owning account and connection. Resource ownership
+failures return a generic 404.
+
+Dhan and Setu sync operations validate the account or connection owner before
+starting the upstream operation. The existing Dhan local-host, confirmation
+header, cooldown, and demo-sync controls remain enabled.
+
+Mutual-fund scheme/NAV analytics operate on shared reference data, and
+`GET /api/setu/health`, the static connection prototype, and the dashboard HTML
+shell do not return user financial records. The dashboard-data API is private.
+No existing non-financial routes are protected by this phase.
 
 ## Future wallet-linking architecture
 

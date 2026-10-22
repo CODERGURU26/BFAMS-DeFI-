@@ -1,9 +1,12 @@
 """Sandbox-only Setu integration endpoints."""
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select, text
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from app.auth.authorization import get_owned_consent, get_owned_connection
+from app.auth.deps import get_current_user
+from app.auth.schemas import UserResponse
 from app.integrations.setu.client import SetuClient
 from app.integrations.setu.config import SetuSettings
 from app.integrations.setu.exceptions import (
@@ -34,7 +37,7 @@ from app.integrations.setu.service import (
     request_fi_data_fetch,
     refresh_consent_status,
 )
-from app.models import ConsentRecord, DataProvider, FinancialConnection, User
+from app.models import ConsentRecord, DataProvider, FinancialConnection
 from database import get_test_engine
 
 router = APIRouter(prefix="/api/setu", tags=["Setu sandbox"])
@@ -75,6 +78,7 @@ def setu_health() -> dict[str, str | bool]:
 @router.post("/consents", response_model=ConsentResponse)
 def request_consent(
     request: CreateConsentRequest,
+    current_user: UserResponse = Depends(get_current_user),
     session: Session = Depends(get_setu_test_db),
 ) -> ConsentResponse:
     settings = SetuSettings()
@@ -89,31 +93,31 @@ def request_consent(
             detail="Setu sandbox configuration is incomplete.",
         )
 
-    connection_row = session.execute(
-        select(FinancialConnection, DataProvider.provider_code)
-        .join(DataProvider, DataProvider.id == FinancialConnection.provider_id)
-        .where(FinancialConnection.id == request.connection_id)
-    ).first()
-    if connection_row is None:
-        raise HTTPException(status_code=404, detail="Setu sandbox connection not found.")
-
-    connection, provider_code = connection_row
-    user = session.get(User, connection.user_id)
-    user_connection_count = session.scalar(
-        select(func.count())
-        .select_from(FinancialConnection)
-        .where(FinancialConnection.user_id == connection.user_id)
+    connection = get_owned_connection(
+        session,
+        request.connection_id,
+        current_user.user_id,
     )
-    if (
-        user is None
-        or user_connection_count != 1
-        or not is_setu_sandbox_connection(connection, provider_code)
-    ):
-        raise HTTPException(status_code=404, detail="Setu sandbox connection not found.")
+    provider_code = session.scalar(
+        select(DataProvider.provider_code).where(
+            DataProvider.id == connection.provider_id
+        )
+    )
+    if not is_setu_sandbox_connection(connection, provider_code):
+        raise HTTPException(status_code=404, detail="Resource not found.")
 
     try:
         with SetuClient(settings) as client:
-            return create_consent(client, request)
+            consent = create_consent(client, request)
+        session.add(
+            ConsentRecord(
+                connection_id=connection.id,
+                external_consent_id=consent.id,
+                status=consent.status.lower(),
+            )
+        )
+        session.commit()
+        return consent
     except SetuAPIError as exc:
         detail = {
             "message": "Setu consent request failed.",
@@ -136,7 +140,10 @@ def request_consent(
 @router.get("/consents/{consent_id}", response_model=ConsentResponse)
 def get_consent_status(
     consent_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+    session: Session = Depends(get_setu_test_db),
 ) -> ConsentResponse:
+    get_owned_consent(session, consent_id, current_user.user_id)
     settings = SetuSettings()
     if settings.environment != "sandbox":
         raise HTTPException(
@@ -166,7 +173,10 @@ def get_consent_status(
 def request_data_session(
     consent_id: str,
     request: CreateDataSessionRequest,
+    current_user: UserResponse = Depends(get_current_user),
+    session: Session = Depends(get_setu_test_db),
 ) -> DataSessionResponse:
+    get_owned_consent(session, consent_id, current_user.user_id)
     settings = SetuSettings()
     if settings.environment != "sandbox":
         raise HTTPException(
@@ -203,8 +213,12 @@ def request_data_session(
 @router.get("/sessions/{session_id}")
 def get_data_session(
     session_id: str,
+    consent_id: str = Query(...),
     poll: bool = False,
+    current_user: UserResponse = Depends(get_current_user),
+    session: Session = Depends(get_setu_test_db),
 ) -> dict:
+    get_owned_consent(session, consent_id, current_user.user_id)
     settings = SetuSettings()
     if settings.environment != "sandbox":
         raise HTTPException(
@@ -220,14 +234,21 @@ def get_data_session(
     try:
         with SetuClient(settings) as client:
             if not poll:
-                return retrieve_data_session(client, session_id)
-            return poll_data_session(
-                client,
-                session_id,
-                interval_seconds=settings.session_poll_interval_seconds,
-                max_attempts=settings.session_poll_max_attempts,
-                timeout_seconds=settings.session_poll_timeout_seconds,
-            )
+                data_session = retrieve_data_session(client, session_id)
+            else:
+                data_session = poll_data_session(
+                    client,
+                    session_id,
+                    interval_seconds=settings.session_poll_interval_seconds,
+                    max_attempts=settings.session_poll_max_attempts,
+                    timeout_seconds=settings.session_poll_timeout_seconds,
+                )
+        response_consent_id = data_session.get("consentId")
+        if response_consent_id != consent_id:
+            raise HTTPException(status_code=404, detail="Resource not found.")
+        return data_session
+    except HTTPException:
+        raise
     except SetuDataSessionTerminalError as exc:
         raise HTTPException(
             status_code=409,
@@ -249,8 +270,14 @@ def get_data_session(
 def fetch_data_session(
     consent_id: str,
     session_id: str,
+    current_user: UserResponse = Depends(get_current_user),
     session: Session = Depends(get_setu_test_db),
 ) -> dict[str, str | int]:
+    record, connection = get_owned_consent(
+        session,
+        consent_id,
+        current_user.user_id,
+    )
     settings = SetuSettings()
     if settings.environment != "sandbox":
         raise HTTPException(
@@ -263,28 +290,13 @@ def fetch_data_session(
             detail="Setu sandbox configuration is incomplete.",
         )
 
-    consent_rows = session.execute(
-        select(ConsentRecord, FinancialConnection, DataProvider.provider_code)
-        .join(
-            FinancialConnection,
-            FinancialConnection.id == ConsentRecord.connection_id,
-        )
-        .join(DataProvider, DataProvider.id == FinancialConnection.provider_id)
-        .where(ConsentRecord.external_consent_id == consent_id)
-        .limit(2)
-    ).all()
-    if len(consent_rows) != 1:
-        raise HTTPException(status_code=404, detail="Setu consent not found.")
-
-    record, connection, provider_code = consent_rows[0]
-    user = session.get(User, connection.user_id)
-    user_connection_count = session.scalar(
-        select(func.count())
-        .select_from(FinancialConnection)
-        .where(FinancialConnection.user_id == connection.user_id)
+    provider_code = session.scalar(
+        select(DataProvider.provider_code)
+        .join(FinancialConnection, FinancialConnection.provider_id == DataProvider.id)
+        .where(FinancialConnection.id == connection.id)
     )
-    if user is None or user_connection_count != 1 or not is_setu_sandbox_connection(connection, provider_code):
-        raise HTTPException(status_code=404, detail="Setu consent not found.")
+    if not is_setu_sandbox_connection(connection, provider_code):
+        raise HTTPException(status_code=404, detail="Resource not found.")
 
     try:
         with SetuClient(settings) as client:
@@ -317,8 +329,14 @@ def fetch_data_session(
 def request_fi_fetch(
     consent_id: str,
     session_id: str,
+    current_user: UserResponse = Depends(get_current_user),
     session: Session = Depends(get_setu_test_db),
 ) -> dict[str, str]:
+    record, connection = get_owned_consent(
+        session,
+        consent_id,
+        current_user.user_id,
+    )
     settings = SetuSettings()
     if settings.environment != "sandbox":
         raise HTTPException(
@@ -331,32 +349,13 @@ def request_fi_fetch(
             detail="Setu sandbox configuration is incomplete.",
         )
 
-    consent_rows = session.execute(
-        select(ConsentRecord, FinancialConnection, DataProvider.provider_code)
-        .join(
-            FinancialConnection,
-            FinancialConnection.id == ConsentRecord.connection_id,
-        )
-        .join(DataProvider, DataProvider.id == FinancialConnection.provider_id)
-        .where(ConsentRecord.external_consent_id == consent_id)
-        .limit(2)
-    ).all()
-    if len(consent_rows) != 1:
-        raise HTTPException(status_code=404, detail="Setu consent not found.")
-
-    record, connection, provider_code = consent_rows[0]
-    user = session.get(User, connection.user_id)
-    user_connection_count = session.scalar(
-        select(func.count())
-        .select_from(FinancialConnection)
-        .where(FinancialConnection.user_id == connection.user_id)
+    provider_code = session.scalar(
+        select(DataProvider.provider_code)
+        .join(FinancialConnection, FinancialConnection.provider_id == DataProvider.id)
+        .where(FinancialConnection.id == connection.id)
     )
-    if (
-        user is None
-        or user_connection_count != 1
-        or not is_setu_sandbox_connection(connection, provider_code)
-    ):
-        raise HTTPException(status_code=404, detail="Setu consent not found.")
+    if not is_setu_sandbox_connection(connection, provider_code):
+        raise HTTPException(status_code=404, detail="Resource not found.")
 
     try:
         with SetuClient(settings) as client:
@@ -366,7 +365,12 @@ def request_fi_fetch(
                     status_code=409,
                     detail="Setu consent is not approved.",
                 )
+            data_session = retrieve_data_session(client, session_id)
+            if data_session.get("consentId") != consent_id:
+                raise HTTPException(status_code=404, detail="Resource not found.")
             return request_fi_data_fetch(client, record, session_id)
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(
             status_code=409,
@@ -383,8 +387,14 @@ def request_fi_fetch(
 def sync_fi_data(
     consent_id: str,
     session_id: str,
+    current_user: UserResponse = Depends(get_current_user),
     session: Session = Depends(get_setu_test_db),
 ) -> dict[str, int | str | dict[str, int]]:
+    record, connection = get_owned_consent(
+        session,
+        consent_id,
+        current_user.user_id,
+    )
     settings = SetuSettings()
     if settings.environment != "sandbox":
         raise HTTPException(
@@ -397,38 +407,17 @@ def sync_fi_data(
             detail="Setu sandbox configuration is incomplete.",
         )
 
-    connection_rows = session.execute(
-        select(FinancialConnection, DataProvider.provider_code)
-        .join(DataProvider, DataProvider.id == FinancialConnection.provider_id)
-        .where(
-            FinancialConnection.external_connection_id
-            == SETU_SANDBOX_EXTERNAL_CONNECTION_ID
-        )
-        .limit(2)
-    ).all()
-    if len(connection_rows) != 1:
-        raise HTTPException(
-            status_code=404,
-            detail="Dedicated Setu sandbox connection not found.",
-        )
-
-    connection, provider_code = connection_rows[0]
-    user = session.get(User, connection.user_id)
-    user_connection_count = session.scalar(
-        select(func.count())
-        .select_from(FinancialConnection)
-        .where(FinancialConnection.user_id == connection.user_id)
+    provider_code = session.scalar(
+        select(DataProvider.provider_code)
+        .join(FinancialConnection, FinancialConnection.provider_id == DataProvider.id)
+        .where(FinancialConnection.id == connection.id)
     )
     if (
-        user is None
-        or user_connection_count != 1
+        connection.external_connection_id != SETU_SANDBOX_EXTERNAL_CONNECTION_ID
         or provider_code != "setu_sandbox"
         or not is_setu_sandbox_connection(connection, provider_code)
     ):
-        raise HTTPException(
-            status_code=404,
-            detail="Dedicated Setu sandbox connection not found.",
-        )
+        raise HTTPException(status_code=404, detail="Resource not found.")
 
     try:
         with SetuClient(settings) as client:

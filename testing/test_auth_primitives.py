@@ -224,6 +224,23 @@ class AuthPrimitiveTests(unittest.TestCase):
                     now=changed_at,
                 )
 
+    def test_access_token_same_second_as_password_change_remains_valid(self):
+        secret = "s" * 40
+        password_changed_at = datetime.now(timezone.utc).replace(microsecond=500000)
+        issued_at = password_changed_at.replace(microsecond=0)
+        with patch.dict("os.environ", {"AUTH_JWT_SECRET": secret}):
+            token, _ = tokens.create_access_token(
+                str(uuid.uuid4()),
+                now=issued_at,
+            )
+            claims = tokens.decode_access_token(
+                token,
+                password_changed_at=password_changed_at,
+                now=password_changed_at,
+            )
+
+        self.assertEqual(claims["typ"], "access")
+
     def test_refresh_token_is_random_and_only_hash_is_persistable(self):
         first = tokens.create_refresh_token()
         second = tokens.create_refresh_token()
