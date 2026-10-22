@@ -792,9 +792,67 @@ class TestDashboardPortfolioInsights(unittest.TestCase):
         titles = {item["title"] for item in suggestions}
         self.assertTrue("Check price coverage" in titles)
         self.assertTrue("Review stale market data" in titles)
-        self.assertTrue("Single-holding concentration" in titles)
+        self.assertTrue("Review largest holding exposure" in titles)
+        self.assertTrue("Review asset-type mix" in titles)
         self.assertTrue(
             all("buy" not in item["detail"].lower() for item in suggestions)
+        )
+
+    def test_breakdowns_group_by_asset_type_and_limit_holdings_chart(self):
+        holdings = [
+            {
+                "name": f"Fixture {index}",
+                "asset_type": "EQUITY" if index < 6 else "ETF",
+                "market_value": str(20 - index),
+            }
+            for index in range(7)
+        ]
+        holdings.append(
+            {
+                "name": "Unpriced fixture",
+                "asset_type": "MUTUAL_FUND",
+                "market_value": None,
+            }
+        )
+
+        asset_types, largest_holdings = self.dashboard._portfolio_breakdowns(
+            holdings
+        )
+
+        self.assertEqual(
+            [row["name"] for row in asset_types],
+            ["EQUITY", "ETF"],
+        )
+        self.assertEqual(len(largest_holdings), 6)
+        self.assertEqual(largest_holdings[0]["name"], "Fixture 0")
+        self.assertEqual(largest_holdings[-1]["name"], "Other holdings")
+        self.assertAlmostEqual(
+            sum(Decimal(row["share"]) for row in asset_types),
+            Decimal(100),
+        )
+
+    def test_prompts_top_three_concentration_and_complexity_without_trade_advice(self):
+        holdings = [
+            {
+                "name": f"Fixture {index}",
+                "asset_type": "EQUITY",
+                "market_value": "15" if index < 3 else "1",
+                "stale": False,
+            }
+            for index in range(20)
+        ]
+
+        suggestions = self.dashboard._portfolio_suggestions(holdings)
+        titles = {item["title"] for item in suggestions}
+
+        self.assertIn("Check top-three concentration", titles)
+        self.assertIn("Review portfolio complexity", titles)
+        self.assertTrue(
+            all(
+                phrase not in item["detail"].lower()
+                for item in suggestions
+                for phrase in ("buy", "sell", "should invest")
+            )
         )
 
     def test_snapshot_change_uses_only_common_priced_identifiers(self):

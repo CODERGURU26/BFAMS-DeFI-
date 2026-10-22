@@ -128,16 +128,25 @@ def _portfolio_suggestions(holdings: list[dict]) -> list[dict[str, str]]:
         )
 
     if total_value > 0:
-        largest = max(valued, key=lambda row: Decimal(row["market_value"]))
+        ranked = sorted(
+            valued,
+            key=lambda row: Decimal(row["market_value"]),
+            reverse=True,
+        )
+        largest = ranked[0]
         largest_share = Decimal(largest["market_value"]) / total_value
-        if largest_share >= Decimal("0.40"):
+        top_three_share = sum(
+            (Decimal(row["market_value"]) for row in ranked[:3]),
+            Decimal(0),
+        ) / total_value
+        if largest_share >= Decimal("0.25"):
             suggestions.append(
                 {
-                    "title": "Single-holding concentration",
+                    "title": "Review largest holding exposure",
                     "detail": (
-                        f"The largest holding represents {largest_share:.0%} of the "
-                        "priced portfolio. Consider reviewing concentration and risk "
-                        "tolerance; this is an informational prompt, not a trade signal."
+                        f"The largest holding is {largest_share:.0%} of the priced "
+                        "portfolio. Review whether this exposure is intentional and "
+                        "fits your risk tolerance; this is not a trade recommendation."
                     ),
                     "kind": "warn",
                 }
@@ -151,11 +160,37 @@ def _portfolio_suggestions(holdings: list[dict]) -> list[dict[str, str]]:
         if type_share >= Decimal("0.80") and len(by_type) > 1:
             suggestions.append(
                 {
-                    "title": "Asset-type concentration",
+                    "title": "Review asset-type mix",
                     "detail": (
                         f"{largest_type} represents {type_share:.0%} of priced holdings. "
-                        "Review whether this allocation matches your intended "
+                        "Check whether this mix matches your goals and intended "
                         "diversification."
+                    ),
+                    "kind": "info",
+                }
+            )
+
+        if len(ranked) >= 3 and top_three_share >= Decimal("0.70"):
+            suggestions.append(
+                {
+                    "title": "Check top-three concentration",
+                    "detail": (
+                        f"The three largest priced holdings make up "
+                        f"{top_three_share:.0%} of the total. Review exposure to "
+                        "overlapping risks rather than relying on holding count alone."
+                    ),
+                    "kind": "warn",
+                }
+            )
+
+        if len(ranked) >= 20:
+            suggestions.append(
+                {
+                    "title": "Review portfolio complexity",
+                    "detail": (
+                        f"{len(ranked)} holdings are currently priced. Consider "
+                        "reviewing overlap, costs, and whether each position still "
+                        "serves a clear purpose."
                     ),
                     "kind": "info",
                 }
@@ -173,6 +208,66 @@ def _portfolio_suggestions(holdings: list[dict]) -> list[dict[str, str]]:
             }
         )
     return suggestions
+
+
+def _portfolio_breakdowns(
+    holdings: list[dict],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    priced = [
+        row
+        for row in holdings
+        if row["market_value"] is not None
+        and Decimal(row["market_value"]) > 0
+    ]
+    total = sum((Decimal(row["market_value"]) for row in priced), Decimal(0))
+    if total <= 0:
+        return [], []
+
+    by_type: dict[str, Decimal] = defaultdict(Decimal)
+    by_name: dict[str, dict[str, Decimal | str]] = {}
+    for row in priced:
+        value = Decimal(row["market_value"])
+        asset_type = row["asset_type"] or "OTHER"
+        by_type[asset_type] += value
+        entry = by_name.setdefault(
+            row["name"],
+            {"name": row["name"], "value": Decimal(0)},
+        )
+        entry["value"] = Decimal(entry["value"]) + value
+
+    asset_type_rows = [
+        {
+            "name": asset_type,
+            "value": str(value),
+            "share": str(value / total * Decimal(100)),
+        }
+        for asset_type, value in sorted(
+            by_type.items(),
+            key=lambda pair: pair[1],
+            reverse=True,
+        )
+    ]
+    ranked_holdings = sorted(
+        by_name.values(),
+        key=lambda entry: Decimal(entry["value"]),
+        reverse=True,
+    )
+    top_rows = ranked_holdings[:5]
+    if len(ranked_holdings) > 5:
+        others_value = sum(
+            (Decimal(entry["value"]) for entry in ranked_holdings[5:]),
+            Decimal(0),
+        )
+        top_rows.append({"name": "Other holdings", "value": others_value})
+    top_holding_rows = [
+        {
+            "name": str(entry["name"]),
+            "value": str(entry["value"]),
+            "share": str(Decimal(entry["value"]) / total * Decimal(100)),
+        }
+        for entry in top_rows
+    ]
+    return asset_type_rows, top_holding_rows
 
 
 def _comparable_snapshot_change(
@@ -282,6 +377,7 @@ def _dashboard_data(session: Session) -> dict:
         Decimal(0),
     )
     unpriced_count = len(valued_holdings) - len(valued_rows)
+    asset_type_allocation, top_holdings = _portfolio_breakdowns(valued_holdings)
 
     snapshot_dates = session.scalars(
         select(InvestmentHolding.observed_at)
@@ -491,6 +587,8 @@ def _dashboard_data(session: Session) -> dict:
                 {key: value for key, value in row.items() if key != "identifier"}
                 for row in valued_holdings
             ],
+            "asset_type_allocation": asset_type_allocation,
+            "top_holdings": top_holdings,
             "snapshot_history": snapshot_history,
             "comparable_change": comparable_change,
             "suggestions": _portfolio_suggestions(valued_holdings),
@@ -565,10 +663,12 @@ _DASHBOARD_HTML = """<!doctype html>
   <section class="grid kpis" id="kpis"><div class="card"><div class="label">Latest snapshot holdings</div><div class="value loading">—</div></div><div class="card"><div class="label">Dhan trades</div><div class="value loading">—</div></div><div class="card"><div class="label">Snapshot value</div><div class="value loading">—</div></div><div class="card"><div class="label">Net flows equal snapshot</div><div class="value loading">—</div></div></section>
   <section class="section panel"><div class="section-head"><h2>Live Dhan positions</h2><button class="button" id="live-valuation" type="button">Fetch from Dhan</button></div><div class="grid market-grid"><div class="market card"><strong id="dhan-holdings-count">—</strong><span>Holdings</span></div><div class="market card"><strong id="dhan-position-count">—</strong><span>Positions</span></div><div class="market card"><strong id="dhan-orders-count">—</strong><span>Today's orders</span></div><div class="market card"><strong id="dhan-realized-pnl">—</strong><span>Realized P&amp;L</span></div><div class="market card"><strong id="dhan-unrealized-pnl">—</strong><span>Unrealized P&amp;L</span></div><div class="market card"><strong id="dhan-day-pnl">—</strong><span>Day P&amp;L</span></div></div><p id="live-valuation-status" class="foot" aria-live="polite">Fetched on request from Dhan Holdings, Positions, and Orders APIs. P&amp;L is not calculated from market quotes.</p><div class="table-wrap"><table><thead><tr><th>Instrument</th><th>Position</th><th>Product</th><th class="num">Net quantity</th><th class="num">Realized P&amp;L</th><th class="num">Unrealized P&amp;L</th><th class="num">Day P&amp;L</th></tr></thead><tbody id="dhan-open-positions"></tbody></table></div></section>
   <section class="section grid visual-grid">
-    <div class="panel"><div class="section-head"><h2>Portfolio allocation</h2><span class="pill" id="valuation-coverage">Loading</span></div><p class="subtle" id="valuation-note"></p><svg id="allocation-chart" class="chart" viewBox="0 0 360 260" role="img" aria-label="Current portfolio allocation chart"></svg><div id="allocation-legend" class="legend"></div></div>
-    <div class="panel"><div class="section-head"><h2>Portfolio value over snapshots</h2><span class="pill" id="portfolio-change">Loading</span></div><p class="subtle">Valued using locally stored market prices/NAVs as of each snapshot date. Not intraday quotes.</p><svg id="history-chart" class="chart" viewBox="0 0 720 260" role="img" aria-label="Portfolio valuation trend chart"></svg><p class="subtle" id="history-note"></p></div>
+    <div class="panel"><div class="section-head"><h2>Value by holding</h2><span class="pill" id="valuation-coverage">Loading</span></div><p class="subtle" id="valuation-note"></p><svg id="allocation-chart" class="chart" viewBox="0 0 360 260" role="img" aria-label="Current portfolio allocation chart"></svg><div id="allocation-legend" class="legend"></div></div>
+    <div class="panel"><div class="section-head"><h2>Portfolio value over snapshots</h2><span class="pill" id="portfolio-change">Loading</span></div><p class="subtle">Valued using locally stored market prices/NAVs as of each snapshot date. Not intraday quotes or returns.</p><svg id="history-chart" class="chart" viewBox="0 0 720 260" role="img" aria-label="Portfolio valuation trend chart"></svg><p class="subtle" id="history-note"></p></div>
+    <div class="panel"><div class="section-head"><h2>Asset-type allocation</h2><span class="pill">Priced holdings</span></div><p class="subtle">Shows the mix by asset type. Unpriced positions are excluded.</p><svg id="asset-type-chart" class="chart" viewBox="0 0 440 260" role="img" aria-label="Portfolio allocation by asset type"></svg></div>
+    <div class="panel"><div class="section-head"><h2>Largest holdings</h2><span class="pill">Priced holdings</span></div><p class="subtle">Top five positions plus any remaining holdings grouped together.</p><svg id="top-holdings-chart" class="chart" viewBox="0 0 440 260" role="img" aria-label="Largest portfolio holdings by estimated market value"></svg></div>
   </section>
-  <section class="section panel"><div class="section-head"><h2>Portfolio review prompts</h2><span class="pill">Informational only</span></div><div id="suggestions" class="recommendations"></div><p class="foot">These are basic price-coverage and concentration checks, not personalized investment advice or buy/sell recommendations.</p></section>
+  <section class="section panel"><div class="section-head"><h2>Portfolio review prompts</h2><span class="pill">Educational · informational</span></div><div id="suggestions" class="recommendations"></div><p class="foot">Rule-based prompts based on available data, not personalized financial advice or buy/sell recommendations. Validate goals, time horizon, costs, taxes, and risk tolerance independently.</p></section>
   <section class="section panel"><div class="section-head"><h2>Latest holdings valuation</h2><span class="pill" id="valuation-as-of">Loading</span></div><div class="table-wrap holdings"><table><thead><tr><th>Holding</th><th>Type</th><th class="num">Quantity</th><th class="num">Price / NAV</th><th class="num">Market value</th><th>Price date</th><th>Status</th></tr></thead><tbody id="holdings-valuation"></tbody></table></div></section>
   <section class="section grid twocol">
     <div class="panel"><div class="section-head"><h2>Import health</h2><span class="pill" id="db-name">Loading</span></div><div id="health"></div></div>
@@ -586,6 +686,7 @@ const COLORS=['#68d9bd','#68a8f0','#d6a8ff','#f3c66b','#f28fa0','#7ed1e6','#ffa6
 function statusLine(label,value,kind=''){const row=document.createElement('div');row.className='statusline';const l=document.createElement('span');l.className='status-label';l.textContent=label;const v=document.createElement('span');v.className='pill '+kind;v.textContent=value;row.append(l,v);return row}
 function svgElement(name,attrs={}){const node=document.createElementNS('http://www.w3.org/2000/svg',name);for(const [key,value] of Object.entries(attrs))node.setAttribute(key,String(value));return node}
 function renderAllocation(rows,total){const chart=byId('allocation-chart'),legend=byId('allocation-legend');chart.replaceChildren();legend.replaceChildren();const priced=rows.filter(row=>row.market_value!==null&&Number(row.market_value)>0);if(!priced.length){const text=svgElement('text',{x:180,y:130,'text-anchor':'middle'});text.textContent='No local prices available';chart.append(text);return}const groupTotals=new Map();priced.forEach(row=>groupTotals.set(row.name,(groupTotals.get(row.name)||0)+Number(row.market_value)));const entries=[...groupTotals.entries()].sort((a,b)=>b[1]-a[1]);const circumference=2*Math.PI*76;let offset=0;entries.forEach(([name,value],index)=>{const share=value/total;const color=COLORS[index%COLORS.length];const circle=svgElement('circle',{cx:180,cy:120,r:76,fill:'none',stroke:color,'stroke-width':29,'stroke-dasharray':`${share*circumference} ${circumference-share*circumference}`,'stroke-dashoffset':-offset,transform:'rotate(-90 180 120)'});const title=svgElement('title');title.textContent=`${name}: ${money(value)} (${(share*100).toFixed(1)}%)`;circle.append(title);chart.append(circle);offset+=share*circumference;const line=document.createElement('div');line.className='legend-row';const label=document.createElement('span');label.className='legend-label';const dot=document.createElement('span');dot.className='legend-dot';dot.style.backgroundColor=color;const titleText=document.createElement('span');titleText.className='legend-name';titleText.textContent=name;label.append(dot,titleText);const amount=document.createElement('span');amount.textContent=`${money(value)} · ${(share*100).toFixed(1)}%`;line.append(label,amount);legend.append(line)});const center=svgElement('text',{x:180,y:116,'text-anchor':'middle',style:'font-size:13px'});center.textContent='Priced value';const value=svgElement('text',{x:180,y:139,'text-anchor':'middle',style:'font-size:15px;font-weight:700;fill:#e8edf8'});value.textContent=money(total);chart.append(center,value)}
+function renderBreakdownChart(id,rows){const chart=byId(id);chart.replaceChildren();if(!rows.length){const empty=svgElement('text',{x:220,y:130,'text-anchor':'middle'});empty.textContent='No priced holdings available';chart.append(empty);return}const maximum=Math.max(...rows.map(row=>Number(row.value)));const rowHeight=34,top=16,labelWidth=142,barWidth=190;rows.forEach((row,index)=>{const y=top+index*rowHeight,label=svgElement('text',{x:2,y:y+14,'font-size':10});const labelValue=row.name.length>19?row.name.slice(0,18)+'…':row.name;label.textContent=labelValue;const labelTitle=svgElement('title');labelTitle.textContent=row.name;label.append(labelTitle);chart.append(label);const background=svgElement('rect',{x:labelWidth,y:y,width:barWidth,height:17,rx:5,fill:'#202b40'});chart.append(background);const width=Math.max(2,barWidth*Number(row.value)/maximum);const bar=svgElement('rect',{x:labelWidth,y:y,width,height:17,rx:5,fill:COLORS[index%COLORS.length]});const title=svgElement('title');title.textContent=`${row.name}: ${money(row.value)} · ${Number(row.share).toFixed(1)}%`;bar.append(title);chart.append(bar);const share=svgElement('text',{x:labelWidth+barWidth+8,y:y+13,'font-size':10});share.textContent=`${Number(row.share).toFixed(1)}%`;chart.append(share)})}
 function renderHistory(history,comparison){const chart=byId('history-chart');chart.replaceChildren();if(!history.length){byId('history-note').textContent='No holdings snapshots yet.';byId('portfolio-change').textContent='No snapshots';return}const width=720,height=260,left=58,right=18,top=20,bottom=45,values=history.map(row=>Number(row.market_value)),min=Math.min(...values),max=Math.max(...values),range=max-min||Math.max(max*.05,1),points=history.map((row,index)=>({x:history.length===1?(left+width-right)/2:left+index*(width-left-right)/(history.length-1),y:top+(max-values[index])*(height-top-bottom)/range,row}));chart.append(svgElement('line',{x1:left,y1:height-bottom,x2:width-right,y2:height-bottom,stroke:'#34425d'}));const path=svgElement('polyline',{points:points.map(point=>`${point.x},${point.y}`).join(' '),fill:'none',stroke:'#68d9bd','stroke-width':3,'stroke-linejoin':'round','stroke-linecap':'round'});chart.append(path);points.forEach(point=>{const circle=svgElement('circle',{cx:point.x,cy:point.y,r:5,fill:'#68d9bd'});const title=svgElement('title');title.textContent=`${new Date(point.row.observed_at).toLocaleString('en-IN')}: ${money(point.row.market_value)} · ${number(point.row.valued_count)} priced`;circle.append(title);chart.append(circle)});const first=history[0],last=history[history.length-1];if(history.length>1){if(comparison&&comparison.amount!==null&&comparison.count>0){const delta=Number(comparison.amount),pct=comparison.percentage===null?null:Number(comparison.percentage);byId('portfolio-change').textContent=`Comparable change: ${delta>=0?'+':''}${money(delta)}${pct===null?'':` (${pct>=0?'+':''}${pct.toFixed(2)}%)`} · ${number(comparison.count)} holdings`;byId('portfolio-change').className='pill '+(delta>=0?'ok':'warn')}else{byId('portfolio-change').textContent='No comparable priced holdings';byId('portfolio-change').className='pill warn'}byId('history-note').textContent=`${new Date(first.observed_at).toLocaleDateString('en-IN')} → ${new Date(last.observed_at).toLocaleDateString('en-IN')} · ${history.length} snapshots. Trend totals may have different price coverage; comparable change uses only positions priced in both latest snapshots and is not investment return.`}else{byId('portfolio-change').textContent='1 snapshot';byId('portfolio-change').className='pill warn';byId('history-note').textContent='Sync again after the cooldown to build a valuation trend.'}const leftLabel=svgElement('text',{x:left,y:height-12});leftLabel.textContent=new Date(first.observed_at).toLocaleDateString('en-IN');chart.append(leftLabel);const rightLabel=svgElement('text',{x:width-right,y:height-12,'text-anchor':'end'});rightLabel.textContent=new Date(last.observed_at).toLocaleDateString('en-IN');chart.append(rightLabel)}
 function renderSuggestions(items){const container=byId('suggestions');container.replaceChildren();items.forEach(item=>{const card=document.createElement('article');card.className='recommendation '+(item.kind||'info');const title=document.createElement('strong');title.textContent=item.title;const detail=document.createElement('p');detail.textContent=item.detail;card.append(title,detail);container.append(card)})}
 function renderHoldingTable(rows){const body=byId('holdings-valuation');body.replaceChildren();rows.forEach(row=>{const tr=document.createElement('tr');[row.name,row.asset_type,qty(row.quantity),row.price===null?'—':money(row.price),row.market_value===null?'Not priced':money(row.market_value),row.price_date||'—',row.status+(row.stale?' · stale':'')].forEach((value,index)=>{const td=document.createElement('td');td.textContent=value;if(index>=2&&index<=4)td.className='num';tr.append(td)});body.append(tr)})}
@@ -595,7 +696,7 @@ async function load(){byId('updated').textContent='Refreshing…';byId('updated'
   document.querySelector('#kpis .card:nth-child(3) .label').textContent='Priced market value';
   const kpiValues=[number(d.holdings_rows),number(d.trade_rows),money(d.holdings_market_value),`${number(d.quantity_matching_groups||0)} / ${number(d.matched_security_groups||0)}`];
   [...byId('kpis').children].forEach((card,i)=>{card.querySelector('.value').textContent=kpiValues[i]});
-  const coverage=Number(d.valuation_coverage||0);byId('valuation-coverage').textContent=`${number(d.valued_count)} / ${number(d.holdings_rows)} priced`;byId('valuation-note').textContent=`${number(d.unpriced_count)} holding(s) are excluded from the current estimated total. Price date: ${d.valuation_as_of||'—'}.`;byId('valuation-as-of').textContent=`As of ${d.valuation_as_of||'—'} · ${Math.round(coverage*100)}% coverage`;renderAllocation(d.valued_holdings||[],Number(d.holdings_market_value||0));renderHistory(d.snapshot_history||[],d.comparable_change);renderSuggestions(d.suggestions||[]);renderHoldingTable(d.valued_holdings||[]);
+  const coverage=Number(d.valuation_coverage||0);byId('valuation-coverage').textContent=`${number(d.valued_count)} / ${number(d.holdings_rows)} priced`;byId('valuation-note').textContent=`${number(d.unpriced_count)} holding(s) are excluded from the current estimated total. Price date: ${d.valuation_as_of||'—'}.`;byId('valuation-as-of').textContent=`As of ${d.valuation_as_of||'—'} · ${Math.round(coverage*100)}% coverage`;renderAllocation(d.valued_holdings||[],Number(d.holdings_market_value||0));renderHistory(d.snapshot_history||[],d.comparable_change);renderBreakdownChart('asset-type-chart',d.asset_type_allocation||[]);renderBreakdownChart('top-holdings-chart',d.top_holdings||[]);renderSuggestions(d.suggestions||[]);renderHoldingTable(d.valued_holdings||[]);
   const health=byId('health');health.replaceChildren();
   health.append(statusLine('Dhan demat account',d.account_exists?'Connected':'Not found',d.account_exists?'ok':'bad'));
   health.append(statusLine('Holdings snapshot',`${number(d.holdings_rows)} rows · ${d.observed_at?new Date(d.observed_at).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}):'No timestamp'}`,d.holdings_rows?'ok':'warn'));
