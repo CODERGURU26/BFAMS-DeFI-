@@ -11,6 +11,7 @@ from app.routes import (
     testing_dashboard,
     transactions,
 )
+from app.auth.routes import router as auth_router
 
 app = FastAPI(
     title="BFAMS-DeFi API",
@@ -26,6 +27,7 @@ app.include_router(portfolio.router)
 app.include_router(testing_dashboard.router)
 app.include_router(connection_wizard.router)
 app.include_router(setu.router)
+app.include_router(auth_router)
 
 
 @app.get("/")
