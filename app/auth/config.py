@@ -3,6 +3,10 @@
 import os
 
 from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+
+
+load_dotenv()
 
 
 ACCESS_TOKEN_MINUTES = 15

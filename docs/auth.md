@@ -46,6 +46,12 @@ to `/auth`, and lasts seven days. Refresh and logout require the
 `X-BFAMS-Auth: 1` header. If an `Origin` header is present, it must match the
 request origin.
 
+The local `/testing/dashboard` page includes an authentication workflow panel
+for registration, login, token refresh, session listing/revocation, password
+change, logout, and logout-all. The access token is held only in page memory;
+reloading the page requires signing in again. Registration still depends on
+`AUTH_REGISTRATION_ENABLED`.
+
 Login failures are limited per client IP to five per minute and twenty per
 hour. Authentication endpoints also enforce account lockout after consecutive
 credential failures. Security headers are applied to all responses, including
