@@ -32,6 +32,7 @@ def _utc_now(now: datetime | None = None) -> datetime:
 def create_access_token(
     subject: str,
     *,
+    session_id: str | None = None,
     now: datetime | None = None,
 ) -> tuple[str, int]:
     if not subject:
@@ -46,6 +47,8 @@ def create_access_token(
         "jti": str(uuid.uuid4()),
         "typ": "access",
     }
+    if session_id is not None:
+        claims["sid"] = session_id
     return jwt.encode(claims, get_jwt_secret(), algorithm="HS256"), (
         ACCESS_TOKEN_MINUTES * 60
     )

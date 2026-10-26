@@ -135,6 +135,7 @@ class AuthPrimitiveTests(unittest.TestCase):
             issued_at = datetime.now(timezone.utc)
             token, expires_in = tokens.create_access_token(
                 str(uuid.uuid4()),
+                session_id=str(uuid.uuid4()),
                 now=issued_at,
             )
             claims = tokens.decode_access_token(token, now=issued_at)
@@ -143,6 +144,7 @@ class AuthPrimitiveTests(unittest.TestCase):
         self.assertEqual(claims["iss"], "bfams")
         self.assertEqual(claims["typ"], "access")
         self.assertIn("jti", claims)
+        self.assertIn("sid", claims)
 
     def test_access_tokens_reject_expired_tampered_none_and_wrong_issuer(self):
         secret = "s" * 40

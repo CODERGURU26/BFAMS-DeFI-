@@ -31,6 +31,8 @@ class AuthFrontendTests(unittest.TestCase):
             'id="mfa-setup-flow"',
             'id="mfa-disable-form"',
             "'/auth/sessions'",
+            "Revoke current session",
+            "This session was revoked. Sign in again to continue.",
             "'/auth/change-password'",
             "'/auth/logout-all'",
             "'/auth/mfa/setup'",

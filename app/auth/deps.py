@@ -1,5 +1,6 @@
 """Authentication dependencies using the isolated test database."""
 
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Generator
 from uuid import UUID
@@ -12,7 +13,7 @@ from sqlalchemy.orm import Session
 from app.auth.config import AuthConfigurationError
 from app.auth.schemas import UserResponse
 from app.auth.tokens import AccessTokenError, decode_access_token
-from app.models import User, UserCredential
+from app.models import RefreshToken, User, UserCredential
 from database import get_test_engine
 
 
@@ -56,6 +57,23 @@ def get_current_user(
         claims = decode_access_token(credentials.credentials)
         user_id = UUID(claims["sub"])
         assert_auth_database(db)
+        session_id = claims.get("sid")
+        if session_id is not None:
+            if not isinstance(session_id, str):
+                raise _unauthorized()
+            session_uuid = UUID(session_id)
+            active_session = db.scalar(
+                select(RefreshToken.id)
+                .where(
+                    RefreshToken.user_id == user_id,
+                    RefreshToken.family_id == session_uuid,
+                    RefreshToken.revoked_at.is_(None),
+                    RefreshToken.expires_at > datetime.now(timezone.utc),
+                )
+                .limit(1)
+            )
+            if active_session is None:
+                raise _unauthorized()
         credential = db.execute(
             select(UserCredential)
             .join(User, User.id == UserCredential.user_id)

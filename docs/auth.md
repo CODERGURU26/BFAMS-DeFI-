@@ -68,9 +68,11 @@ consecutive failures lock the credential for 15 minutes.
 Access tokens use HS256 and expire after 15 minutes. Refresh tokens are random
 opaque values; only their SHA-256 hashes are stored. Refresh-token reuse
 revokes the associated token family. Changing a password invalidates access
-tokens issued before the recorded password-change time. Authentication audit
-events contain only user references, event types, and timestamps; authentication
-secrets and credential values are not event fields.
+tokens issued before the recorded password-change time. Access tokens are bound
+to their refresh-token family, so revoking a session also invalidates its
+already-issued access tokens. Authentication audit events contain only user
+references, event types, and timestamps; authentication secrets and credential
+values are not event fields.
 
 TOTP MFA is optional. When enabled, login first verifies the password and
 returns a short-lived, HttpOnly MFA challenge cookie; a second `/auth/login`

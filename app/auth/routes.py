@@ -239,8 +239,14 @@ def _require_request_protection(request: Request) -> None:
             raise HTTPException(status_code=403, detail="Origin not allowed.")
 
 
-def _issue_access_token(user_id: uuid.UUID) -> TokenResponse:
-    raw_token, expires_in = tokens.create_access_token(str(user_id))
+def _issue_access_token(
+    user_id: uuid.UUID,
+    session_id: uuid.UUID,
+) -> TokenResponse:
+    raw_token, expires_in = tokens.create_access_token(
+        str(user_id),
+        session_id=str(session_id),
+    )
     return TokenResponse(access_token=raw_token, expires_in=expires_in)
 
 
@@ -339,8 +345,14 @@ def _finish_mfa_login(
         if is_legacy:
             configuration.secret = totp_crypto.encrypt_totp_secret(secret)
         _record_event(db, "login_success", credential.user_id)
-        raw_refresh, _ = _new_refresh_token(db, user_id=credential.user_id)
-        access_response = _issue_access_token(credential.user_id)
+        raw_refresh, refresh_row = _new_refresh_token(
+            db,
+            user_id=credential.user_id,
+        )
+        access_response = _issue_access_token(
+            credential.user_id,
+            refresh_row.family_id,
+        )
         db.commit()
         _MFA_LOGIN_CHALLENGES.pop(key, None)
         _set_refresh_cookie(response, raw_refresh)
@@ -462,8 +474,14 @@ def login(
     if replacement_hash is not None:
         credential.password_hash = replacement_hash
     _record_event(db, "login_success", credential.user_id)
-    raw_refresh, _ = _new_refresh_token(db, user_id=credential.user_id)
-    access_response = _issue_access_token(credential.user_id)
+    raw_refresh, refresh_row = _new_refresh_token(
+        db,
+        user_id=credential.user_id,
+    )
+    access_response = _issue_access_token(
+        credential.user_id,
+        refresh_row.family_id,
+    )
     db.commit()
     _set_refresh_cookie(response, raw_refresh)
     return access_response
@@ -535,7 +553,10 @@ def refresh(
     current.revoked_at = now
     current.replaced_by = replacement.id
     _record_event(db, "refresh", current.user_id)
-    access_response = _issue_access_token(current.user_id)
+    access_response = _issue_access_token(
+        current.user_id,
+        current.family_id,
+    )
     db.commit()
     _set_refresh_cookie(response, next_raw)
     return access_response
@@ -596,6 +617,12 @@ def list_sessions(
     current_hash = (
         tokens.hash_refresh_token(current_refresh) if current_refresh else None
     )
+    current_family_id = None
+    authorization = request.headers.get("Authorization", "").split(maxsplit=1)
+    if len(authorization) == 2 and authorization[0].lower() == "bearer":
+        current_family_id = tokens.decode_access_token(
+            authorization[1]
+        ).get("sid")
     rows = db.scalars(
         select(RefreshToken)
         .where(
@@ -610,7 +637,11 @@ def list_sessions(
             "session_id": str(row.id),
             "issued_at": row.issued_at.isoformat(),
             "expires_at": row.expires_at.isoformat(),
-            "current": row.token_hash == current_hash,
+            "current": (
+                str(row.family_id) == current_family_id
+                if current_family_id is not None
+                else row.token_hash == current_hash
+            ),
         }
         for row in rows
     ]
@@ -622,6 +653,7 @@ def list_sessions(
 )
 def revoke_session(
     session_id: uuid.UUID,
+    request: Request,
     current_user: UserResponse = Depends(get_current_user),
     db: Session = Depends(get_auth_db),
 ) -> Response:
@@ -650,7 +682,25 @@ def revoke_session(
     if revoked.rowcount:
         _record_event(db, "logout", current_user.user_id)
     db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    current_refresh = request.cookies.get(_REFRESH_COOKIE)
+    if current_refresh:
+        current_refresh_family = db.scalar(
+            select(RefreshToken.family_id).where(
+                RefreshToken.user_id == current_user.user_id,
+                RefreshToken.token_hash
+                == tokens.hash_refresh_token(current_refresh),
+            )
+        )
+        if current_refresh_family == session.family_id:
+            response.delete_cookie(
+                key=_REFRESH_COOKIE,
+                path="/auth",
+                secure=config.cookie_secure(),
+                httponly=True,
+                samesite="strict",
+            )
+    return response
 
 
 @router.post("/logout-all", status_code=status.HTTP_204_NO_CONTENT)

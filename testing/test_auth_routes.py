@@ -545,6 +545,12 @@ class AuthRouteTests(unittest.TestCase):
             headers={"Authorization": f"Bearer {login_a.json()['access_token']}"},
         )
         self.assertEqual(response.status_code, 204)
+        self.assertIn("bfams_refresh=", response.headers.get("set-cookie", ""))
+        access_revoked = self.client.get(
+            "/auth/me",
+            headers={"Authorization": f"Bearer {login_a.json()['access_token']}"},
+        )
+        self.assertEqual(access_revoked.status_code, 401)
         self.client.cookies.clear()
         self.client.cookies.set(
             "bfams_refresh",
@@ -558,6 +564,13 @@ class AuthRouteTests(unittest.TestCase):
         )
         self.assertEqual(refresh.status_code, 401)
 
+        login_a = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "long-enough-test-password",
+            },
+        )
         foreign_email = f"{uuid.uuid4()}@example.test"
         credential_b = self._create_user(email=foreign_email)
         self.client.cookies.clear()
@@ -728,6 +741,14 @@ class AuthRouteTests(unittest.TestCase):
             headers={"X-BFAMS-Auth": "1"},
         )
         self.assertEqual(logout.status_code, 204)
+        fresh_login = self.client.post(
+            "/auth/login",
+            json={
+                "email": self.email,
+                "password": "long-enough-test-password",
+            },
+        )
+        self.assertEqual(fresh_login.status_code, 200)
         changed = self.client.post(
             "/auth/change-password",
             headers={
