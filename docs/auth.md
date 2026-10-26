@@ -27,7 +27,8 @@ All routes use the `/auth` prefix.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `POST` | `/auth/login` | Verify email and password; return a short-lived bearer access token and set a refresh cookie |
+| `POST` | `/auth/login` | Verify credentials; returns a bearer token for accounts without MFA or starts a short-lived MFA challenge |
+| `POST` | `/auth/login/cancel` | Cancel the pending MFA login challenge |
 | `POST` | `/auth/refresh` | Rotate the refresh token and return a new access token |
 | `POST` | `/auth/logout` | Revoke the refresh-token family and clear the refresh cookie |
 | `GET` | `/auth/sessions` | List active refresh-token sessions without token material |
@@ -71,8 +72,10 @@ tokens issued before the recorded password-change time. Authentication audit
 events contain only user references, event types, and timestamps; authentication
 secrets and credential values are not event fields.
 
-TOTP MFA is optional. When enabled, login requires the password and a six-digit
-RFC 6238 code in a 30-second acceptance window. Setup returns the secret and
+TOTP MFA is optional. When enabled, login first verifies the password and
+returns a short-lived, HttpOnly MFA challenge cookie; a second `/auth/login`
+request submits the six-digit RFC 6238 code. The challenge expires after five
+minutes, is bound to the client IP, and is kept only in process memory. Setup returns the secret and
 provisioning URI once; the encrypted secret is retained in the
 `user_totp_secrets` table. Configure `AUTH_TOTP_ENCRYPTION_KEY` with a valid
 Fernet key independent of `AUTH_JWT_SECRET`; generate and protect the key

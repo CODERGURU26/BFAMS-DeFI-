@@ -1,12 +1,16 @@
 """Email/password authentication routes."""
 
 import re
+import hashlib
+import secrets
 import uuid
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -18,6 +22,7 @@ from app.auth.config import AuthConfigurationError
 from app.auth.deps import assert_auth_database, get_auth_db, get_current_user
 from app.auth.schemas import (
     CredentialsRequest,
+    LoginRequest,
     PasswordChangeRequest,
     RegistrationResponse,
     TotpCodeRequest,
@@ -39,11 +44,26 @@ from app.models import (
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 _REFRESH_COOKIE = "bfams_refresh"
+_MFA_CHALLENGE_COOKIE = "bfams_mfa_challenge"
+_MFA_CHALLENGE_TTL = timedelta(minutes=5)
+_MFA_CHALLENGE_MAX_ATTEMPTS = 5
 _DUMMY_PASSWORD_HASH = security.PASSWORD_HASHER.hash("auth-timing-normalization")
 _LOGIN_FAILURES_BY_IP: dict[str, deque[datetime]] = defaultdict(deque)
 _LOGIN_FAILURES_LOCK = Lock()
 _LOGIN_RATE_LIMITS = ((5, timedelta(minutes=1)), (20, timedelta(hours=1)))
 _LEGACY_TOTP_SECRET = re.compile(r"^[A-Z2-7]{16,}$")
+
+
+@dataclass
+class _MfaLoginChallenge:
+    user_id: uuid.UUID
+    expires_at: datetime
+    client_ip: str
+    attempts: int = 0
+
+
+_MFA_LOGIN_CHALLENGES: dict[str, _MfaLoginChallenge] = {}
+_MFA_LOGIN_CHALLENGES_LOCK = Lock()
 _ALLOWED_AUTH_EVENTS = {
     "register",
     "login_success",
@@ -87,6 +107,52 @@ def _load_totp_secret(configuration: UserTotpSecret) -> tuple[str, bool]:
     if _LEGACY_TOTP_SECRET.fullmatch(stored_value):
         return stored_value, True
     return totp_crypto.decrypt_totp_secret(stored_value), False
+
+
+def _challenge_key(raw_challenge: str) -> str:
+    return hashlib.sha256(raw_challenge.encode("utf-8")).hexdigest()
+
+
+def _issue_mfa_challenge(user_id: uuid.UUID, client_ip: str, now: datetime) -> str:
+    raw_challenge = secrets.token_urlsafe(32)
+    with _MFA_LOGIN_CHALLENGES_LOCK:
+        for key, challenge in list(_MFA_LOGIN_CHALLENGES.items()):
+            if challenge.expires_at <= now:
+                _MFA_LOGIN_CHALLENGES.pop(key, None)
+        _MFA_LOGIN_CHALLENGES[_challenge_key(raw_challenge)] = _MfaLoginChallenge(
+            user_id=user_id,
+            expires_at=now + _MFA_CHALLENGE_TTL,
+            client_ip=client_ip,
+        )
+    return raw_challenge
+
+
+def _delete_mfa_challenge(raw_challenge: str | None) -> None:
+    if raw_challenge:
+        with _MFA_LOGIN_CHALLENGES_LOCK:
+            _MFA_LOGIN_CHALLENGES.pop(_challenge_key(raw_challenge), None)
+
+
+def _set_mfa_challenge_cookie(response: Response, raw_challenge: str) -> None:
+    response.set_cookie(
+        key=_MFA_CHALLENGE_COOKIE,
+        value=raw_challenge,
+        max_age=int(_MFA_CHALLENGE_TTL.total_seconds()),
+        httponly=True,
+        secure=config.cookie_secure(),
+        samesite="strict",
+        path="/auth",
+    )
+
+
+def _clear_mfa_challenge_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=_MFA_CHALLENGE_COOKIE,
+        path="/auth",
+        secure=config.cookie_secure(),
+        httponly=True,
+        samesite="strict",
+    )
 
 
 def _record_event(
@@ -178,17 +244,133 @@ def _issue_access_token(user_id: uuid.UUID) -> TokenResponse:
     return TokenResponse(access_token=raw_token, expires_in=expires_in)
 
 
-@router.post("/login", response_model=TokenResponse)
+def _finish_mfa_login(
+    request: Request,
+    response: Response,
+    db: Session,
+    code: str | None,
+) -> TokenResponse:
+    raw_challenge = request.cookies.get(_MFA_CHALLENGE_COOKIE)
+    now = _now()
+    if raw_challenge is None:
+        raise HTTPException(status_code=401, detail="invalid credentials")
+
+    key = _challenge_key(raw_challenge)
+    with _MFA_LOGIN_CHALLENGES_LOCK:
+        challenge = _MFA_LOGIN_CHALLENGES.get(key)
+        if (
+            challenge is None
+            or challenge.expires_at <= now
+            or challenge.client_ip != _client_ip(request)
+        ):
+            _MFA_LOGIN_CHALLENGES.pop(key, None)
+            _clear_mfa_challenge_cookie(response)
+            raise HTTPException(status_code=401, detail="invalid credentials")
+
+        credential = db.execute(
+            select(UserCredential)
+            .where(UserCredential.user_id == challenge.user_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+        configuration = db.execute(
+            select(UserTotpSecret)
+            .where(
+                UserTotpSecret.user_id == challenge.user_id,
+                UserTotpSecret.enabled.is_(True),
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        currently_locked = (
+            credential is not None
+            and credential.locked_until is not None
+            and credential.locked_until > now
+        )
+
+        secret = None
+        is_legacy = False
+        if (
+            credential is not None
+            and credential.is_active
+            and configuration is not None
+            and not currently_locked
+        ):
+            try:
+                secret, is_legacy = _load_totp_secret(configuration)
+            except AuthConfigurationError:
+                secret = None
+        code_valid = (
+            secret is not None
+            and totp_security.verify_totp_code(secret, code)
+        )
+        if (
+            credential is None
+            or not credential.is_active
+            or currently_locked
+            or configuration is None
+            or not code_valid
+        ):
+            _record_login_failure(request, now)
+            if credential is not None:
+                _record_event(db, "login_failed", credential.user_id)
+                if not currently_locked:
+                    credential.failed_attempts += 1
+                    if credential.failed_attempts >= config.LOCKOUT_FAILURES:
+                        credential.locked_until = now + timedelta(
+                            minutes=config.LOCKOUT_MINUTES
+                        )
+                        _record_event(db, "locked", credential.user_id)
+            challenge.attempts += 1
+            exhausted = (
+                challenge.attempts >= _MFA_CHALLENGE_MAX_ATTEMPTS
+                or (
+                    credential is not None
+                    and credential.locked_until is not None
+                    and credential.locked_until > now
+                )
+            )
+            if exhausted:
+                _MFA_LOGIN_CHALLENGES.pop(key, None)
+                _clear_mfa_challenge_cookie(response)
+            db.commit()
+            raise HTTPException(status_code=401, detail="invalid credentials")
+
+        credential.failed_attempts = 0
+        credential.locked_until = None
+        if is_legacy:
+            configuration.secret = totp_crypto.encrypt_totp_secret(secret)
+        _record_event(db, "login_success", credential.user_id)
+        raw_refresh, _ = _new_refresh_token(db, user_id=credential.user_id)
+        access_response = _issue_access_token(credential.user_id)
+        db.commit()
+        _MFA_LOGIN_CHALLENGES.pop(key, None)
+        _set_refresh_cookie(response, raw_refresh)
+        _clear_mfa_challenge_cookie(response)
+        return access_response
+
+
+@router.post(
+    "/login",
+    response_model=TokenResponse,
+    responses={202: {"description": "Additional MFA verification required"}},
+)
 def login(
-    body: CredentialsRequest,
+    body: LoginRequest,
     response: Response,
     request: Request,
     db: Session = Depends(get_auth_db),
-) -> TokenResponse:
+) -> TokenResponse | JSONResponse:
     _ensure_configured()
     now = _now()
     _check_login_rate_limit(request, now)
     assert_auth_database(db)
+    if body.email is None and body.password is None and body.totp_code is not None:
+        return _finish_mfa_login(request, response, db, body.totp_code)
+    if body.email is None or body.password is None:
+        _record_login_failure(request, now)
+        _record_event(db, "login_failed", None)
+        db.commit()
+        raise HTTPException(status_code=401, detail="invalid credentials")
+
     credential = None
     if is_valid_email(body.email):
         credential = db.execute(
@@ -222,21 +404,25 @@ def login(
     )
     totp_configuration = None
     totp_valid = True
+    mfa_challenge_required = False
     if valid_password and credential.is_active and not currently_locked:
         totp_configuration = db.get(UserTotpSecret, credential.user_id)
         if totp_configuration is not None and totp_configuration.enabled:
-            try:
-                secret, is_legacy = _load_totp_secret(totp_configuration)
-                totp_valid = totp_security.verify_totp_code(
-                    secret,
-                    body.totp_code,
-                )
-                if totp_valid and is_legacy:
-                    totp_configuration.secret = totp_crypto.encrypt_totp_secret(
-                        secret
+            if body.totp_code is None:
+                mfa_challenge_required = True
+            else:
+                try:
+                    secret, is_legacy = _load_totp_secret(totp_configuration)
+                    totp_valid = totp_security.verify_totp_code(
+                        secret,
+                        body.totp_code,
                     )
-            except AuthConfigurationError:
-                totp_valid = False
+                    if totp_valid and is_legacy:
+                        totp_configuration.secret = totp_crypto.encrypt_totp_secret(
+                            secret
+                        )
+                except AuthConfigurationError:
+                    totp_valid = False
     if (
         not credential.is_active
         or currently_locked
@@ -255,6 +441,22 @@ def login(
         db.commit()
         raise HTTPException(status_code=401, detail="invalid credentials")
 
+    if mfa_challenge_required:
+        if replacement_hash is not None:
+            credential.password_hash = replacement_hash
+        raw_challenge = _issue_mfa_challenge(
+            credential.user_id,
+            _client_ip(request),
+            now,
+        )
+        db.commit()
+        challenge_response = JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={"mfa_required": True},
+        )
+        _set_mfa_challenge_cookie(challenge_response, raw_challenge)
+        return challenge_response
+
     credential.failed_attempts = 0
     credential.locked_until = None
     if replacement_hash is not None:
@@ -265,6 +467,14 @@ def login(
     db.commit()
     _set_refresh_cookie(response, raw_refresh)
     return access_response
+
+
+@router.post("/login/cancel", status_code=status.HTTP_204_NO_CONTENT)
+def cancel_mfa_login(request: Request) -> Response:
+    _delete_mfa_challenge(request.cookies.get(_MFA_CHALLENGE_COOKIE))
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    _clear_mfa_challenge_cookie(response)
+    return response
 
 
 @router.post("/refresh", response_model=TokenResponse)

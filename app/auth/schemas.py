@@ -14,12 +14,22 @@ _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 class CredentialsRequest(BaseModel):
     email: str
     password: str
-    totp_code: str | None = None
 
     @field_validator("email")
     @classmethod
     def normalize(cls, value: str) -> str:
         return normalize_email(value)
+
+
+class LoginRequest(BaseModel):
+    email: str | None = None
+    password: str | None = None
+    totp_code: str | None = None
+
+    @field_validator("email")
+    @classmethod
+    def normalize(cls, value: str | None) -> str | None:
+        return normalize_email(value) if value is not None else None
 
 
 def is_valid_email(value: str) -> bool:

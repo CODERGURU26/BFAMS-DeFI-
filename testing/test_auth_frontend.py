@@ -27,9 +27,19 @@ class AuthFrontendTests(unittest.TestCase):
             'id="auth-refresh"',
             'id="auth-logout"',
             'id="auth-logout-all"',
+            'id="auth-mfa-step"',
+            'id="mfa-setup-flow"',
+            'id="mfa-disable-form"',
             "'/auth/sessions'",
             "'/auth/change-password'",
             "'/auth/logout-all'",
+            "'/auth/mfa/setup'",
+            "'/auth/mfa/verify'",
+            "'/auth/mfa/status'",
+            "'/auth/mfa/disable'",
+            "Scan this QR code with Microsoft Authenticator or Google Authenticator.",
+            "MFA enabled successfully.",
+            "MFA disabled successfully.",
             "Signed out",
         ):
             with self.subTest(expected=expected):
@@ -40,5 +50,7 @@ class AuthFrontendTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("let accessToken = null", response.text)
+        self.assertNotIn('name="totp_code"', response.text)
+        self.assertIn("Login → MFA Verification → Dashboard", response.text)
         self.assertNotIn("localStorage", response.text)
         self.assertNotIn("sessionStorage", response.text)

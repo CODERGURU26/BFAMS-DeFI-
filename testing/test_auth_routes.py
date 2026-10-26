@@ -83,6 +83,8 @@ class AuthRouteTests(unittest.TestCase):
     def setUp(self):
         with routes._LOGIN_FAILURES_LOCK:
             routes._LOGIN_FAILURES_BY_IP.clear()
+        with routes._MFA_LOGIN_CHALLENGES_LOCK:
+            routes._MFA_LOGIN_CHALLENGES.clear()
         self.secret = "route-test-secret-that-is-long-enough"
         self.totp_encryption_key = Fernet.generate_key().decode("ascii")
         self.environment = patch.dict(
@@ -109,6 +111,8 @@ class AuthRouteTests(unittest.TestCase):
         self.environment.stop()
         with routes._LOGIN_FAILURES_LOCK:
             routes._LOGIN_FAILURES_BY_IP.clear()
+        with routes._MFA_LOGIN_CHALLENGES_LOCK:
+            routes._MFA_LOGIN_CHALLENGES.clear()
 
     def _create_user(
         self,
@@ -1024,19 +1028,13 @@ class AuthRouteTests(unittest.TestCase):
         )
         self.assertIn("mfa_disabled", event_types)
 
-    def test_mfa_login_requires_code_with_indistinguishable_failures(self):
+    def test_mfa_login_uses_two_step_challenge_and_rejects_invalid_code(self):
         self._create_user()
         _, secret = self._enable_mfa()
 
         attempts = [
             {"email": f"{uuid.uuid4()}@example.test", "password": "wrong-password"},
             {"email": self.email, "password": "wrong-password"},
-            {"email": self.email, "password": "long-enough-test-password"},
-            {
-                "email": self.email,
-                "password": "long-enough-test-password",
-                "totp_code": "000000",
-            },
         ]
         failures = [
             self.client.post("/auth/login", json=attempt)
@@ -1050,16 +1048,36 @@ class AuthRouteTests(unittest.TestCase):
             )
         )
         self.assertTrue(all(secret not in response.text for response in failures))
-        successful = self.client.post(
+
+        challenge = self.client.post(
             "/auth/login",
             json={
                 "email": self.email,
                 "password": "long-enough-test-password",
-                "totp_code": pyotp.TOTP(secret).now(),
             },
+        )
+        self.assertEqual(challenge.status_code, 202)
+        self.assertEqual(challenge.json(), {"mfa_required": True})
+        self.assertTrue(
+            self.client.cookies.get(routes._MFA_CHALLENGE_COOKIE)
+        )
+
+        invalid = self.client.post(
+            "/auth/login",
+            json={"totp_code": "000000" if pyotp.TOTP(secret).now() != "000000" else "999999"},
+        )
+        self.assertEqual(invalid.status_code, 401)
+        self.assertEqual(invalid.json(), {"detail": "invalid credentials"})
+
+        successful = self.client.post(
+            "/auth/login",
+            json={"totp_code": pyotp.TOTP(secret).now()},
         )
         self.assertEqual(successful.status_code, 200, successful.text)
         self.assertNotIn(secret, successful.text)
+        self.assertIsNone(
+            self.client.cookies.get(routes._MFA_CHALLENGE_COOKIE)
+        )
 
     def test_password_change_keeps_mfa_enabled(self):
         self._create_user()
@@ -1095,14 +1113,11 @@ class AuthRouteTests(unittest.TestCase):
                 "password": "brand-new-long-password",
             },
         )
-        self.assertEqual(login_without_code.status_code, 401)
+        self.assertEqual(login_without_code.status_code, 202)
+        self.assertEqual(login_without_code.json(), {"mfa_required": True})
         login_with_code = self.client.post(
             "/auth/login",
-            json={
-                "email": self.email,
-                "password": "brand-new-long-password",
-                "totp_code": pyotp.TOTP(secret).now(),
-            },
+            json={"totp_code": pyotp.TOTP(secret).now()},
         )
         self.assertEqual(login_with_code.status_code, 200)
 
