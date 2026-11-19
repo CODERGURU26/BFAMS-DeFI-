@@ -1,4 +1,4 @@
-"""Authentication dependencies using the isolated test database."""
+"""Authentication dependencies using the selected application database."""
 
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -14,7 +14,7 @@ from app.auth.config import AuthConfigurationError
 from app.auth.schemas import UserResponse
 from app.auth.tokens import AccessTokenError, decode_access_token
 from app.models import RefreshToken, User, UserCredential
-from database import get_test_engine
+from database import get_app_engine, settings
 
 
 _bearer = HTTPBearer(auto_error=False)
@@ -22,7 +22,7 @@ _bearer = HTTPBearer(auto_error=False)
 
 @lru_cache(maxsize=1)
 def _auth_engine():
-    return get_test_engine()
+    return get_app_engine()
 
 
 def get_auth_db() -> Generator[Session, None, None]:
@@ -35,8 +35,8 @@ def get_auth_db() -> Generator[Session, None, None]:
 
 def assert_auth_database(db: Session) -> None:
     database_name = db.execute(text("SELECT current_database()")).scalar_one()
-    if database_name != "BFAMS-DeFI-test":
-        raise RuntimeError("Authentication requires BFAMS-DeFI-test.")
+    if database_name != settings.app_database_name:
+        raise RuntimeError("Authentication database does not match the selected target.")
 
 
 def _unauthorized() -> HTTPException:

@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request
 from sqlalchemy import text
-from database import engine
+from database import get_app_engine, settings
 from app.routes import (
     accounts,
     connections,
@@ -54,6 +54,7 @@ app.include_router(connections.router)
 app.include_router(mf_analytics.router)
 app.include_router(portfolio.router)
 app.include_router(testing_dashboard.router)
+app.include_router(testing_dashboard.product_router)
 app.include_router(connection_wizard.router)
 app.include_router(setu.router)
 app.include_router(auth_router)
@@ -75,12 +76,12 @@ def health_check():
 @app.get("/health/db")
 def database_health_check():
     try:
-        with engine.connect() as connection:
+        with get_app_engine().connect() as connection:
             connection.execute(text("SELECT 1"))
 
         return {
             "status": "healthy",
-            "database": "connected",
+            "database": settings.app_database_name,
         }
     except Exception:
         raise HTTPException(

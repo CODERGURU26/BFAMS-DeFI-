@@ -5,6 +5,7 @@ import pytest
 from scripts.refresh_reference_data import (
     freshness_warning,
     nse_date_window,
+    parse_args,
     parse_amfi_response,
 )
 
@@ -19,6 +20,11 @@ def test_nse_date_window_includes_lookback_days():
 def test_nse_date_window_rejects_nonpositive_lookback():
     with pytest.raises(ValueError):
         nse_date_window(date(2026, 11, 19), 0)
+
+
+def test_refresh_target_defaults_to_test_and_can_select_staging():
+    assert parse_args([]).target == "test"
+    assert parse_args(["--target", "main"]).target == "main"
 
 
 def test_freshness_warning_only_reports_data_past_threshold():

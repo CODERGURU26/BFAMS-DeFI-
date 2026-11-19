@@ -1,4 +1,4 @@
-"""Refresh AMFI NAV and NSE reference data in BFAMS-DeFI-test."""
+"""Refresh AMFI NAV and NSE reference data in TEST or guarded staging."""
 
 import argparse
 from datetime import date, datetime, timedelta
@@ -147,23 +147,37 @@ def current_holdings_coverage(session: Session, as_of_date: date):
     return priced_count, len(holdings)
 
 
-def refresh_reference_data(as_of_date: date, lookback_days: int) -> int:
+def refresh_reference_data(
+    as_of_date: date,
+    lookback_days: int,
+    target: str = "test",
+) -> int:
     os.chdir(PROJECT_ROOT)
-    from database import get_test_engine
+    from database import engine as main_engine, get_test_engine, settings
 
-    engine = get_test_engine()
+    if target == "test":
+        db_engine = get_test_engine()
+        expected_database = settings.test_db_name
+    elif target == "main":
+        if settings.db_name != "BFAMS-DeFI":
+            raise RuntimeError("Staging refresh requires configured DB_NAME=BFAMS-DeFI.")
+        db_engine = main_engine
+        expected_database = "BFAMS-DeFI"
+    else:
+        raise ValueError("target must be 'test' or 'main'.")
+
     errors = []
     warnings = []
     try:
-        with engine.connect() as connection:
+        with db_engine.connect() as connection:
             database_name = connection.execute(
                 text("SELECT current_database()")
             ).scalar_one()
-        if database_name != "BFAMS-DeFI-test":
+        if database_name != expected_database:
             raise RuntimeError(
-                f"Safety abort: connected to '{database_name}', expected 'BFAMS-DeFI-test'."
+                f"Safety abort: connected to '{database_name}', expected '{expected_database}'."
             )
-        print(f"Verified database: {database_name}")
+        print(f"Verified {target} database: {database_name}")
 
         try:
             content = fetch_amfi_nav()
@@ -172,7 +186,7 @@ def refresh_reference_data(as_of_date: date, lookback_days: int) -> int:
                 as_of_date,
             )
             save_amfi_snapshot(content)
-            with Session(engine) as session:
+            with Session(db_engine) as session:
                 load_result = load_nav(
                     session,
                     schemes,
@@ -207,13 +221,14 @@ def refresh_reference_data(as_of_date: date, lookback_days: int) -> int:
                 base_dir=PROJECT_ROOT / "data" / "nse",
                 eligible_series=NSE_SERIES,
                 indices_to_track=DEFAULT_BROAD_INDICES,
-            ) as importer, Session(engine) as session:
+            ) as importer, Session(db_engine) as session:
                 nse_result = importer.import_bounded_batch(
                     session=session,
                     start_date=start_date,
                     end_date=end_date,
                     pause_seconds=0.1,
                     force=True,
+                    expected_database_name=expected_database,
                 )
             print(
                 "NSE: "
@@ -230,7 +245,7 @@ def refresh_reference_data(as_of_date: date, lookback_days: int) -> int:
         except (RuntimeError, SQLAlchemyError, OSError) as exc:
             errors.append(f"NSE refresh failed: {type(exc).__name__}: {exc}")
 
-        with Session(engine) as session:
+        with Session(db_engine) as session:
             latest_prices = session.execute(
                 select(
                     SecurityDailyPrice.series,
@@ -279,7 +294,8 @@ def refresh_reference_data(as_of_date: date, lookback_days: int) -> int:
             print("Latest portfolio coverage: no holdings found.")
 
     finally:
-        engine.dispose()
+        if target == "test":
+            db_engine.dispose()
 
     for warning in warnings:
         print(f"WARNING: {warning}")
@@ -290,6 +306,12 @@ def refresh_reference_data(as_of_date: date, lookback_days: int) -> int:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--target",
+        choices=("test", "main"),
+        default="test",
+        help="Database to refresh; main is guarded to BFAMS-DeFI staging.",
+    )
     parser.add_argument(
         "--lookback-days",
         type=int,
@@ -311,7 +333,11 @@ def main(argv=None) -> int:
         print("ERROR: --lookback-days must be at least one.")
         return 2
     try:
-        return refresh_reference_data(args.as_of_date, args.lookback_days)
+        return refresh_reference_data(
+            args.as_of_date,
+            args.lookback_days,
+            target=args.target,
+        )
     except (RuntimeError, SQLAlchemyError, OSError) as exc:
         print(f"ERROR: Reference-data refresh aborted: {type(exc).__name__}: {exc}")
         return 1

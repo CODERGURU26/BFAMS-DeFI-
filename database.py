@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
@@ -10,6 +12,19 @@ class Settings(BaseSettings):
     db_user: str
     db_password: str
     test_db_name: str | None = None
+    app_database_target: Literal["test", "main"] = "test"
+
+    @property
+    def app_database_name(self) -> str:
+        if self.app_database_target == "test":
+            if not self.test_db_name:
+                raise RuntimeError("TEST_DB_NAME is not set")
+            return self.test_db_name
+        if self.db_name != "BFAMS-DeFI":
+            raise RuntimeError(
+                "APP_DATABASE_TARGET=main is restricted to BFAMS-DeFI staging."
+            )
+        return self.db_name
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -57,3 +72,13 @@ def get_test_engine():
         database=settings.test_db_name,
     )
     return create_engine(test_url, pool_pre_ping=True)
+
+
+def get_app_engine():
+    """Return the explicitly selected application database engine."""
+    if settings.app_database_target == "main":
+        target_name = settings.app_database_name
+        if target_name != "BFAMS-DeFI":
+            raise RuntimeError("Application main target is not the staging database.")
+        return engine
+    return get_test_engine()

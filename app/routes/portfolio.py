@@ -2,7 +2,7 @@
 Portfolio routes — Dhan demat holdings & trades ingestion + valuation.
 
 All write endpoints require an `account_id` query parameter pointing to an
-existing financial_accounts row in the test database.  They are idempotent:
+existing financial_accounts row in the selected application database. They are idempotent:
 re-running the same CSV never creates duplicates.
 
 Endpoints
@@ -53,6 +53,7 @@ from app.models import (
     FinancialConnection,
     InvestmentHolding,
 )
+from database import settings
 from app.demat_ingestion import (
     IngestionSummary,
     RowError,
@@ -173,12 +174,12 @@ class DhanLiveValuationResponse(BaseModel):
 
 
 def _verify_test_db(session: Session) -> None:
-    """Abort if not connected to the test database."""
+    """Abort if the session is not connected to the selected application database."""
     db_name = session.execute(text("SELECT current_database()")).scalar()
-    if db_name != "BFAMS-DeFI-test":
+    if db_name != settings.app_database_name:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Safety check failed: connected to '{db_name}', expected 'BFAMS-DeFI-test'.",
+            detail="Safety check failed: database does not match the selected application target.",
         )
 
 
@@ -294,10 +295,10 @@ def _validate_local_dhan_request(request: Request) -> None:
 @router.post(
     "/dhan/sync",
     response_model=DhanSyncResponse,
-    summary="Sync Dhan holdings into the TEST database",
+    summary="Sync Dhan holdings into the selected application database",
     description=(
         "Fetches only the Dhan holdings endpoint and stores a new holdings "
-        "snapshot for the configured Dhan TEST account. No trades are fetched."
+        "snapshot for the configured Dhan account. No trades are fetched."
     ),
 )
 def sync_dhan_holdings(

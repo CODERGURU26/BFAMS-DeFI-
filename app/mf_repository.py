@@ -4,7 +4,7 @@ app/mf_repository.py
 Read-only database queries and access layer for Mutual Fund Analytics.
 
 Safety guarantees:
-1. Verifies current_database() == settings.test_db_name before every query operation.
+1. Verifies current_database() matches the explicitly selected application database.
 2. Read-only: Never performs INSERT, UPDATE, DELETE, or DDL.
 3. Indexes utilized: Uses MfScheme.scheme_code (unique index) and
    MfNav.scheme_id + nav_date (composite primary key index).
@@ -38,11 +38,11 @@ from app.mf_analytics import (
 
 def verify_test_db(session: Session) -> None:
     """
-    Enforce safety requirement: verify connected database is strictly BFAMS-DeFI-test.
+    Ensure mutual-fund queries use the selected application database.
     Aborts immediately if connected to any other database.
     """
     current_db = session.execute(text("SELECT current_database()")).scalar()
-    expected_db = settings.test_db_name or "BFAMS-DeFI-test"
+    expected_db = settings.app_database_name
     if current_db != expected_db:
         raise RuntimeError(
             f"SAFETY ABORT: Connected to database '{current_db}', expected '{expected_db}'. "

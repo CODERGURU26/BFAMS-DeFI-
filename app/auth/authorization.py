@@ -11,14 +11,15 @@ from app.models import (
     FinancialAccount,
     FinancialConnection,
 )
+from database import settings
 
 
 def assert_authorization_database(session: Session) -> None:
     database_name = session.execute(
         text("SELECT current_database()")
     ).scalar_one()
-    if database_name != "BFAMS-DeFI-test":
-        raise RuntimeError("Authorization requires BFAMS-DeFI-test.")
+    if database_name != settings.app_database_name:
+        raise RuntimeError("Authorization database does not match the selected target.")
 
 
 def get_owned_account(

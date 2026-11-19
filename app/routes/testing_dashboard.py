@@ -1,4 +1,4 @@
-"""Read-only local dashboard for reviewing TEST database portfolio imports."""
+"""Read-only local dashboard for reviewing portfolio imports."""
 
 import re
 from collections import defaultdict
@@ -11,6 +11,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.dependencies import get_mf_db
+from app.auth.config import registration_enabled
 from app.auth.deps import get_current_user
 from app.auth.schemas import UserResponse
 from app.models import (
@@ -23,6 +24,7 @@ from app.models import (
     SecurityDailyPrice,
     Transaction,
 )
+from database import settings
 from app.demat_ingestion import _is_valid_isin, value_equity_holding
 from app.mf_valuation import value_investment_holding_record
 
@@ -303,10 +305,10 @@ def _comparable_snapshot_change(
 
 def _dashboard_data(session: Session, user_id) -> dict:
     database_name = session.scalar(text("SELECT current_database()"))
-    if database_name != "BFAMS-DeFI-test":
+    if database_name != settings.app_database_name:
         raise HTTPException(
             status_code=503,
-            detail="Testing dashboard requires BFAMS-DeFI-test.",
+            detail="Dashboard database does not match the selected application target.",
         )
 
     owned_accounts = (
@@ -648,7 +650,52 @@ def _dashboard_data(session: Session, user_id) -> dict:
 
 @router.get("", response_class=HTMLResponse, include_in_schema=False)
 def dashboard():
-    return HTMLResponse(_DASHBOARD_HTML)
+    html = _DASHBOARD_HTML
+    if settings.app_database_target == "main":
+        replacements = (
+            ("TEST DATABASE", "STAGING DATABASE"),
+            (
+                "Use a TEST account to check sign-in, session controls, password change, and sign-out.",
+                "Sign in to your staging account. Access tokens remain in this page memory and are not displayed or saved in browser storage.",
+            ),
+            (
+                "Counts are read live from the TEST database.",
+                "Counts are read live from the staging database.",
+            ),
+            ("Sign in to load TEST data.", "Sign in to load staging data."),
+            ("Live TEST data · refreshed", "Live staging data · refreshed"),
+            ("Test dashboard", "Staging dashboard"),
+            ('<a href="/testing/connect">Connect institution</a>', ""),
+        )
+        for old_text, new_text in replacements:
+            html = html.replace(old_text, new_text)
+    if not registration_enabled():
+        html = html.replace(
+            '<form id="auth-register" class="auth-form">',
+            '<form id="auth-register" class="auth-form" hidden>',
+        )
+    return HTMLResponse(html)
+
+
+product_router = APIRouter(tags=["Dashboard"])
+
+
+@product_router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+def product_dashboard():
+    response = dashboard()
+    html = response.body.decode("utf-8").replace(
+        "/testing/dashboard/data",
+        "/dashboard/data",
+    )
+    return HTMLResponse(html)
+
+
+@product_router.get("/dashboard/data")
+def product_dashboard_data(
+    current_user: UserResponse = Depends(get_current_user),
+    session: Session = Depends(get_mf_db),
+):
+    return _dashboard_data(session, current_user.user_id)
 
 
 @router.get("/data")

@@ -531,7 +531,7 @@ class NSEHistoricalImporter:
         1. Checks manifest; skips if already completed unless force=True.
         2. Retrieves or downloads equity bhavcopy & index closing files.
         3. Identifies non-trading days gracefully on 404 without fabricating prices.
-        4. Validates bars and bulk upserts into BFAMS-DeFI-test.
+        4. Validates bars and bulk upserts into the explicitly selected database.
         5. Updates manifest checkpoint.
         """
         dt_str = target_date.isoformat()
@@ -649,15 +649,18 @@ class NSEHistoricalImporter:
         max_trading_days: Optional[int] = None,
         pause_seconds: float = 0.1,
         force: bool = False,
+        expected_database_name: str = "BFAMS-DeFI-test",
     ) -> Dict[str, Any]:
         """
         Processes a bounded batch of dates between start_date and end_date.
         Respects safety limits and pauses politely between downloads.
         """
-        # Safety check: confirm connected database is BFAMS-DeFI-test
+        # Refuse to import if the caller's explicit database target is wrong.
         db_name = session.execute(text("SELECT current_database()")).scalar()
-        if db_name != "BFAMS-DeFI-test":
-            raise RuntimeError(f"ABORT: Connected DB is '{db_name}', expected 'BFAMS-DeFI-test'")
+        if db_name != expected_database_name:
+            raise RuntimeError(
+                f"ABORT: Connected DB is '{db_name}', expected '{expected_database_name}'"
+            )
 
         curr = start_date
         total_days_inspected = 0
