@@ -259,6 +259,37 @@ M&MFIN, N3, 11-Oct-2024, 1000.00, 1005.00, 1010.00, 1000.00, 1005.00, 1005.00, 1
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_bounded_import_forwards_force_flag(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import Mock, patch
+        from app.nse_market_data import NSEHistoricalImporter
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            importer = NSEHistoricalImporter(base_dir=Path(temp_dir))
+            session = Mock()
+            session.execute.return_value.scalar.return_value = "BFAMS-DeFI-test"
+            target_date = date(2026, 11, 19)
+            result = {
+                "date": target_date.isoformat(),
+                "status": "COMPLETED",
+                "action": "IMPORTED",
+                "equity_rows": 1,
+                "index_rows": 1,
+            }
+
+            with patch.object(importer, "process_date", return_value=result) as process:
+                summary = importer.import_bounded_batch(
+                    session=session,
+                    start_date=target_date,
+                    end_date=target_date,
+                    pause_seconds=0,
+                    force=True,
+                )
+
+            process.assert_called_once_with(session, target_date, force=True)
+            self.assertEqual(summary["trading_days_imported"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

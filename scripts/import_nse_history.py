@@ -38,8 +38,8 @@ def parse_args():
     parser.add_argument(
         "--end-date",
         type=str,
-        default="2026-10-13",
-        help="End date in YYYY-MM-DD format (default: 2026-10-13)",
+        default=date.today().isoformat(),
+        help="End date in YYYY-MM-DD format (default: today)",
     )
     parser.add_argument(
         "--max-days",
@@ -56,8 +56,8 @@ def parse_args():
     parser.add_argument(
         "--series",
         type=str,
-        default="EQ,BE",
-        help="Comma-separated eligible equity series (default: EQ,BE)",
+        default="EQ,BE,RR",
+        help="Comma-separated eligible equity series (default: EQ,BE,RR)",
     )
     parser.add_argument(
         "--force",
@@ -117,6 +117,7 @@ def main():
             end_date=end_dt,
             max_trading_days=args.max_days,
             pause_seconds=args.pause,
+            force=args.force,
         )
 
     # 5. Post-Import Verification

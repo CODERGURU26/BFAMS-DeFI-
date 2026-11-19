@@ -648,6 +648,7 @@ class NSEHistoricalImporter:
         end_date: date,
         max_trading_days: Optional[int] = None,
         pause_seconds: float = 0.1,
+        force: bool = False,
     ) -> Dict[str, Any]:
         """
         Processes a bounded batch of dates between start_date and end_date.
@@ -676,7 +677,7 @@ class NSEHistoricalImporter:
 
             total_days_inspected += 1
             try:
-                res = self.process_date(session, curr)
+                res = self.process_date(session, curr, force=force)
                 action = res.get("action")
                 status = res.get("status")
 
