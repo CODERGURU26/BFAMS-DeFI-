@@ -1,4 +1,4 @@
-"""Read-only local dashboard for reviewing portfolio imports."""
+"""Local dashboard for reviewing portfolio data and allocation targets."""
 
 import re
 from collections import defaultdict
@@ -7,13 +7,15 @@ from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from app.dependencies import get_mf_db
+from app.auth.authorization import assert_authorization_database
 from app.auth.config import registration_enabled
 from app.auth.deps import get_current_user
 from app.auth.schemas import UserResponse
+from app.dependencies import get_mf_db
 from app.models import (
     DataSyncRun,
     FinancialAccount,
@@ -21,15 +23,30 @@ from app.models import (
     InvestmentHolding,
     MfNav,
     MfScheme,
+    PortfolioAllocationTarget,
     PortfolioValuationSnapshot,
     PortfolioValuationSnapshotItem,
     SecurityDailyPrice,
     Transaction,
 )
-from database import settings
 from app.portfolio_history import load_daily_portfolio_history, value_holdings
+from database import settings
 
 router = APIRouter(prefix="/testing/dashboard", tags=["Testing dashboard"])
+
+
+class AllocationTargetEntry(BaseModel):
+    asset_type: str = Field(min_length=1, max_length=80)
+    target_percent: Decimal = Field(
+        ge=0,
+        le=100,
+        max_digits=5,
+        decimal_places=2,
+    )
+
+
+class SaveAllocationTargetsRequest(BaseModel):
+    targets: list[AllocationTargetEntry] = Field(min_length=1)
 
 
 def _normalize_name(value: str) -> str:
@@ -216,6 +233,47 @@ def _portfolio_breakdowns(
     return asset_type_rows, top_holding_rows
 
 
+def _allocation_target_summary(
+    asset_type_allocation: list[dict[str, str]],
+    asset_types: set[str],
+    target_rows: list[PortfolioAllocationTarget],
+    unpriced_count: int,
+) -> dict:
+    actual_by_type = {
+        row["name"]: Decimal(row["share"])
+        for row in asset_type_allocation
+    }
+    target_by_type = {
+        row.asset_type: Decimal(row.target_percent)
+        for row in target_rows
+    }
+    target_total = sum(target_by_type.values(), Decimal(0))
+    configured = bool(target_by_type) and target_total == Decimal(100)
+    items = []
+
+    for asset_type in sorted(asset_types | set(target_by_type)):
+        actual = actual_by_type.get(asset_type, Decimal(0))
+        target = target_by_type.get(asset_type)
+        if configured and target is None:
+            target = Decimal(0)
+        drift = actual - target if configured and target is not None else None
+        items.append(
+            {
+                "asset_type": asset_type,
+                "actual_percent": str(actual),
+                "target_percent": str(target) if target is not None else None,
+                "drift_percentage_points": str(drift) if drift is not None else None,
+            }
+        )
+
+    return {
+        "configured": configured,
+        "target_total_percent": str(target_total),
+        "unpriced_holdings": unpriced_count,
+        "items": items,
+    }
+
+
 def _comparable_snapshot_change(
     previous_values: dict[str, Decimal | None],
     current_values: dict[str, Decimal | None],
@@ -264,17 +322,7 @@ def _dashboard_data(session: Session, user_id) -> dict:
         )
         .where(FinancialConnection.user_id == user_id)
     )
-    account = session.scalars(
-        select(FinancialAccount)
-        .join(
-            FinancialConnection,
-            FinancialConnection.id == FinancialAccount.connection_id,
-        )
-        .where(
-            FinancialConnection.user_id == user_id,
-            FinancialAccount.external_account_id == "DHAN-DEMAT-1",
-        )
-    ).first()
+    account = _owned_dhan_account(session, user_id)
     counts = {
         "accounts": session.scalar(
             select(func.count()).select_from(FinancialAccount).where(
@@ -324,6 +372,7 @@ def _dashboard_data(session: Session, user_id) -> dict:
                 ),
                 "snapshot_history": [],
                 "snapshot_freshness": None,
+                "allocation_targets": _allocation_target_summary([], set(), [], 0),
             },
         }
 
@@ -360,6 +409,21 @@ def _dashboard_data(session: Session, user_id) -> dict:
     )
     unpriced_count = len(valued_holdings) - len(valued_rows)
     asset_type_allocation, top_holdings = _portfolio_breakdowns(valued_holdings)
+    asset_types = {
+        row["asset_type"] or "OTHER"
+        for row in valued_holdings
+    }
+    target_rows = session.scalars(
+        select(PortfolioAllocationTarget)
+        .where(PortfolioAllocationTarget.account_id == account.id)
+        .order_by(PortfolioAllocationTarget.asset_type)
+    ).all()
+    allocation_targets = _allocation_target_summary(
+        asset_type_allocation,
+        asset_types,
+        target_rows,
+        unpriced_count,
+    )
 
     snapshot_dates = session.scalars(
         select(InvestmentHolding.observed_at)
@@ -584,6 +648,7 @@ def _dashboard_data(session: Session, user_id) -> dict:
                 for row in valued_holdings
             ],
             "asset_type_allocation": asset_type_allocation,
+            "allocation_targets": allocation_targets,
             "top_holdings": top_holdings,
             "snapshot_history": snapshot_history,
             "comparable_change": comparable_change,
@@ -648,12 +713,124 @@ def dashboard():
 product_router = APIRouter(tags=["Dashboard"])
 
 
+def _owned_dhan_account(session: Session, user_id) -> FinancialAccount | None:
+    return session.scalars(
+        select(FinancialAccount)
+        .join(
+            FinancialConnection,
+            FinancialConnection.id == FinancialAccount.connection_id,
+        )
+        .where(
+            FinancialConnection.user_id == user_id,
+            FinancialAccount.external_account_id == "DHAN-DEMAT-1",
+        )
+    ).first()
+
+
+def _save_allocation_targets(
+    session: Session,
+    user_id,
+    payload: SaveAllocationTargetsRequest,
+) -> dict[str, int | str]:
+    assert_authorization_database(session)
+    account = _owned_dhan_account(session, user_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Dhan account not found.")
+
+    latest_observed = session.scalar(
+        select(InvestmentHolding.observed_at)
+        .where(InvestmentHolding.account_id == account.id)
+        .order_by(InvestmentHolding.observed_at.desc())
+        .limit(1)
+    )
+    current_types = (
+        {
+            asset_type.strip()
+            for asset_type in session.scalars(
+                select(InvestmentHolding.asset_type).where(
+                    InvestmentHolding.account_id == account.id,
+                    InvestmentHolding.observed_at == latest_observed,
+                )
+            ).all()
+            if asset_type and asset_type.strip()
+        }
+        if latest_observed is not None
+        else set()
+    )
+    existing = session.scalars(
+        select(PortfolioAllocationTarget).where(
+            PortfolioAllocationTarget.account_id == account.id
+        )
+    ).all()
+    existing_by_type = {row.asset_type.strip(): row for row in existing}
+    allowed_types = current_types | set(existing_by_type)
+    submitted_types = [entry.asset_type.strip() for entry in payload.targets]
+
+    if not allowed_types:
+        raise HTTPException(
+            status_code=422,
+            detail="Sync holdings before setting allocation targets.",
+        )
+    if len(set(submitted_types)) != len(submitted_types):
+        raise HTTPException(
+            status_code=422,
+            detail="Each asset type can only have one target.",
+        )
+    if set(submitted_types) != allowed_types:
+        raise HTTPException(
+            status_code=422,
+            detail="Submit a target for every current or previously configured asset type.",
+        )
+
+    target_total = sum(
+        (entry.target_percent for entry in payload.targets),
+        Decimal(0),
+    )
+    if target_total != Decimal(100):
+        raise HTTPException(
+            status_code=422,
+            detail="Target percentages must total exactly 100%.",
+        )
+
+    for entry, asset_type in zip(payload.targets, submitted_types):
+        target = existing_by_type.get(asset_type)
+        if target is None:
+            target = PortfolioAllocationTarget(
+                account_id=account.id,
+                asset_type=asset_type,
+                target_percent=entry.target_percent,
+            )
+            session.add(target)
+        else:
+            target.asset_type = asset_type
+            target.target_percent = entry.target_percent
+
+    session.commit()
+    return {
+        "saved": len(payload.targets),
+        "target_total_percent": str(target_total),
+    }
+
+
+@product_router.put("/dashboard/allocation-targets")
+@router.put("/allocation-targets")
+def save_allocation_targets(
+    payload: SaveAllocationTargetsRequest,
+    current_user: UserResponse = Depends(get_current_user),
+    session: Session = Depends(get_mf_db),
+):
+    return _save_allocation_targets(session, current_user.user_id, payload)
+
+
 @product_router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
 def product_dashboard():
     response = dashboard()
     html = response.body.decode("utf-8").replace(
         "/testing/dashboard/data",
         "/dashboard/data",
+    ).replace(
+        "/testing/dashboard/allocation-targets",
+        "/dashboard/allocation-targets",
     )
     return HTMLResponse(html)
 
@@ -696,7 +873,7 @@ _DASHBOARD_HTML = """<!doctype html>
     .status-label{font-size:13px;color:#aab6c9}.pill{border-radius:99px;padding:5px 9px;font-size:11px;font-weight:700;background:#172238;color:#a9bad5}.ok{background:#13302c;color:#7be0bd}.warn{background:#392a18;color:#f4c273}.bad{background:#3b2028;color:#ff9eaa}
     .market-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.market{padding:16px}.market strong{display:block;font-size:22px;margin-bottom:5px}.market span{font-size:12px;color:#9aa8be}
     .visual-grid{grid-template-columns:1fr 1fr}.chart{width:100%;height:auto;min-height:250px}.chart text{fill:#aab6c9;font-size:11px;font-family:inherit}.legend{display:grid;gap:8px;margin-top:12px}.legend-row{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;color:#b8c4d7}.legend-label{display:flex;align-items:center;gap:8px;min-width:0}.legend-dot{width:9px;height:9px;border-radius:50%;flex:none}.legend-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.recommendations{display:grid;gap:10px}.recommendation{padding:13px 15px;border:1px solid #34425d;border-radius:11px;background:#121a2b}.recommendation.warn{border-color:#694c2c}.recommendation.ok{border-color:#286b60}.recommendation strong{display:block;font-size:13px;margin-bottom:5px}.recommendation p{font-size:12px;color:#aab6c9;margin:0;line-height:1.5}.table-wrap.holdings table{min-width:760px}.subtle{font-size:11px;color:#7f8da6;margin:6px 0 0}
-    .table-wrap{overflow:auto;border:1px solid #263149;border-radius:12px}table{border-collapse:collapse;width:100%;min-width:700px;text-align:left}th,td{padding:12px 14px;border-bottom:1px solid #253047;font-size:12px;white-space:nowrap}th{color:#8d9bb3;font-weight:650;background:#131b2b}td{color:#dce4f1}tr:last-child td{border-bottom:0}.num{text-align:right;font-variant-numeric:tabular-nums}.positive{color:#81dfbb}.negative{color:#ff9eaa}
+    .table-wrap{overflow:auto;border:1px solid #263149;border-radius:12px}table{border-collapse:collapse;width:100%;min-width:700px;text-align:left}th,td{padding:12px 14px;border-bottom:1px solid #253047;font-size:12px;white-space:nowrap}th{color:#8d9bb3;font-weight:650;background:#131b2b}td{color:#dce4f1}tr:last-child td{border-bottom:0}.num{text-align:right;font-variant-numeric:tabular-nums}.positive{color:#81dfbb}.negative{color:#ff9eaa}#allocation-target-rows input{width:120px;text-align:right;border:1px solid #34425d;border-radius:8px;background:#0d1423;color:#e8edf8;padding:8px;font:inherit}
     .foot{margin-top:20px;color:#74829a;font-size:11px}.error{color:#ff9eaa}.loading{color:#94a1b8}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
     #dashboard-data[hidden]{display:none}.auth-panel{margin-top:20px}.auth-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.auth-form{display:grid;gap:10px}    .auth-form label{display:grid;gap:6px;color:#aab6c9;font-size:12px}.auth-form input{width:100%;border:1px solid #34425d;border-radius:9px;background:#0d1423;color:#e8edf8;padding:10px 12px;font:inherit}.auth-password-field{display:flex;gap:8px}.auth-password-field input{min-width:0;flex:1}.auth-password-field button{flex:none}.auth-actions{display:flex;gap:8px;flex-wrap:wrap}.auth-state{color:#92a2bd;font-size:12px}.auth-state.error{color:#ff9eaa}.auth-session{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid #263149;font-size:12px}.auth-session:last-child{border:0}.auth-session button{padding:6px 9px;font-size:11px}.auth-only[hidden],.auth-guest[hidden]{display:none}
     .mfa-qr{display:flex;align-items:center;justify-content:center;min-height:210px;margin:12px 0;padding:10px;background:#fff;border-radius:10px;width:max-content;max-width:100%}.mfa-qr canvas,.mfa-qr img{max-width:100%;height:auto}.mfa-secret{word-break:break-all}.auth-step{margin:8px 0 14px;color:#68d9bd;font-size:12px;font-weight:700}
@@ -780,6 +957,14 @@ _DASHBOARD_HTML = """<!doctype html>
     <div class="panel"><div class="section-head"><h2>Asset-type allocation</h2><span class="pill">Priced holdings</span></div><p class="subtle">Shows the mix by asset type. Unpriced positions are excluded.</p><svg id="asset-type-chart" class="chart" viewBox="0 0 440 260" role="img" aria-label="Portfolio allocation by asset type"></svg><div id="allocation-change" class="recommendations"></div></div>
     <div class="panel"><div class="section-head"><h2>Largest holdings</h2><span class="pill">Priced holdings</span></div><p class="subtle">Top five positions plus any remaining holdings grouped together.</p><svg id="top-holdings-chart" class="chart" viewBox="0 0 440 260" role="img" aria-label="Largest portfolio holdings by estimated market value"></svg></div>
   </section>
+  <section class="section panel">
+    <div class="section-head"><h2>Target allocation</h2><span class="pill" id="allocation-target-total">Targets not set</span></div>
+    <p class="subtle">Set a target for each asset type; targets must total 100%. Drift is actual minus target in percentage points.</p>
+    <div class="table-wrap"><table><thead><tr><th>Asset type</th><th class="num">Actual share</th><th class="num">Target share (%)</th><th class="num">Drift</th></tr></thead><tbody id="allocation-target-rows"></tbody></table></div>
+    <div class="auth-actions" style="margin-top:12px"><button class="button" id="save-allocation-targets" type="button" disabled>Save targets</button></div>
+    <p class="subtle" id="allocation-target-note" role="status" aria-live="polite"></p>
+    <p class="foot">Actual allocation uses priced holdings only. Unpriced holdings are excluded; compare this informational view with your own goals. It does not recommend or place trades.</p>
+  </section>
   <section class="section panel"><div class="section-head"><h2>Portfolio review prompts</h2><span class="pill">Educational · informational</span></div><div id="suggestions" class="recommendations"></div><p class="foot">Rule-based prompts based on available data, not personalized financial advice or buy/sell recommendations. Validate goals, time horizon, costs, taxes, and risk tolerance independently.</p></section>
   <section class="section panel"><div class="section-head"><h2>Latest holdings valuation</h2><span class="pill" id="valuation-as-of">Loading</span></div><div class="table-wrap holdings"><table><thead><tr><th>Holding</th><th>Type</th><th class="num">Quantity</th><th class="num">Price / NAV</th><th class="num">Market value</th><th>Price date</th><th>Status</th></tr></thead><tbody id="holdings-valuation"></tbody></table></div></section>
   <section class="section grid twocol">
@@ -798,10 +983,11 @@ let historyRows = [];
 let historyMode = 'sync';
 let historyComparison = null;
 let historyRangeDays = 30;
+let allocationTargetsDirty = false;
 function apiFetch(url,options={}){const headers=new Headers(options.headers||{});if(accessToken)headers.set('Authorization',`Bearer ${accessToken}`);return fetch(url,{...options,headers,cache:options.cache||'no-store'})}
 function authMessage(message,isError=false){const element=byId('auth-message');element.textContent=message;element.className='auth-state'+(isError?' error':'')}
 document.querySelectorAll('.auth-toggle-password').forEach(button=>button.addEventListener('click',()=>{const input=button.parentElement.querySelector('input');const visible=input.type==='password';input.type=visible?'text':'password';button.textContent=visible?'Hide':'Show';button.setAttribute('aria-pressed',String(visible))}));
-function clearDashboardData(){historyRows=[];historyComparison=null;byId('dashboard-data').hidden=true;document.querySelectorAll('#kpis .value').forEach(value=>value.textContent='—');document.querySelector('#kpis .card:nth-child(3) .label').textContent='Snapshot value';byId('dhan-open-positions').replaceChildren();byId('allocation-chart').replaceChildren();byId('history-chart').replaceChildren();byId('asset-type-chart').replaceChildren();byId('top-holdings-chart').replaceChildren();byId('allocation-legend').replaceChildren();byId('allocation-change').replaceChildren();byId('holdings-valuation').replaceChildren();byId('reconciliation').replaceChildren();byId('health').replaceChildren();byId('markets').replaceChildren();byId('suggestions').replaceChildren();byId('sync-status').textContent='';byId('dhan-holdings-count').textContent='—';byId('dhan-position-count').textContent='—';byId('dhan-orders-count').textContent='—';byId('dhan-realized-pnl').textContent='—';byId('dhan-unrealized-pnl').textContent='—';byId('dhan-day-pnl').textContent='—';byId('live-valuation-status').textContent='Fetched on request from Dhan Holdings, Positions, and Orders APIs. P&L is not calculated from market quotes.';byId('valuation-coverage').textContent='Loading';byId('valuation-note').textContent='';byId('valuation-as-of').textContent='Loading';byId('portfolio-change').textContent='Loading';byId('history-note').textContent='';byId('history-freshness').textContent='';byId('recon-status').textContent='Loading';byId('db-name').textContent='Loading';byId('sync-dhan').dataset.accountAvailable='false';byId('updated').textContent='Sign in to load portfolio data.';byId('updated').className='foot'}
+function clearDashboardData(){historyRows=[];historyComparison=null;allocationTargetsDirty=false;byId('dashboard-data').hidden=true;document.querySelectorAll('#kpis .value').forEach(value=>value.textContent='—');document.querySelector('#kpis .card:nth-child(3) .label').textContent='Snapshot value';byId('dhan-open-positions').replaceChildren();byId('allocation-chart').replaceChildren();byId('history-chart').replaceChildren();byId('asset-type-chart').replaceChildren();byId('top-holdings-chart').replaceChildren();byId('allocation-legend').replaceChildren();byId('allocation-change').replaceChildren();byId('allocation-target-rows').replaceChildren();byId('allocation-target-note').textContent='';byId('allocation-target-total').textContent='Targets not set';byId('save-allocation-targets').disabled=true;byId('holdings-valuation').replaceChildren();byId('reconciliation').replaceChildren();byId('health').replaceChildren();byId('markets').replaceChildren();byId('suggestions').replaceChildren();byId('sync-status').textContent='';byId('dhan-holdings-count').textContent='—';byId('dhan-position-count').textContent='—';byId('dhan-orders-count').textContent='—';byId('dhan-realized-pnl').textContent='—';byId('dhan-unrealized-pnl').textContent='—';byId('dhan-day-pnl').textContent='—';byId('live-valuation-status').textContent='Fetched on request from Dhan Holdings, Positions, and Orders APIs. P&L is not calculated from market quotes.';byId('valuation-coverage').textContent='Loading';byId('valuation-note').textContent='';byId('valuation-as-of').textContent='Loading';byId('portfolio-change').textContent='Loading';byId('history-note').textContent='';byId('history-freshness').textContent='';byId('recon-status').textContent='Loading';byId('db-name').textContent='Loading';byId('sync-dhan').dataset.accountAvailable='false';byId('updated').textContent='Sign in to load portfolio data.';byId('updated').className='foot'}
 function authSignedOut(message='Sign in to load user-scoped dashboard data.'){authEpoch++;accessToken=null;clearDashboardData();byId('auth-guest').hidden=false;byId('auth-mfa-step').hidden=true;byId('auth-user').hidden=true;byId('mfa-setup-flow').hidden=true;byId('mfa-disable-form').hidden=true;byId('mfa-secret').textContent='';byId('mfa-qr').replaceChildren();byId('auth-badge').textContent='Signed out';byId('auth-badge').className='pill warn';byId('auth-sessions').replaceChildren();byId('sync-dhan').disabled=true;byId('live-valuation').disabled=true;authMessage(message)}
 async function responseData(response){const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:`Request failed (${response.status})`);return data}
 async function loadSessions(){const rows=await responseData(await apiFetch('/auth/sessions'));const target=byId('auth-sessions');target.replaceChildren();const title=document.createElement('strong');title.textContent=`Active sessions (${rows.length})`;target.append(title);rows.forEach(session=>{const row=document.createElement('div');row.className='auth-session';const text=document.createElement('span');text.textContent=`${new Date(session.issued_at).toLocaleString()} · expires ${new Date(session.expires_at).toLocaleString()}${session.current?' · current':''}`;const button=document.createElement('button');button.className='button';button.type='button';button.textContent=session.current?'Revoke current session':'Revoke';button.addEventListener('click',()=>revokeSession(session.session_id,session.current));row.append(text,button);target.append(row)})}
@@ -831,6 +1017,9 @@ function statusLine(label,value,kind=''){const row=document.createElement('div')
 function svgElement(name,attrs={}){const node=document.createElementNS('http://www.w3.org/2000/svg',name);for(const [key,value] of Object.entries(attrs))node.setAttribute(key,String(value));return node}
 function renderAllocation(rows,total){const chart=byId('allocation-chart'),legend=byId('allocation-legend');chart.replaceChildren();legend.replaceChildren();const priced=rows.filter(row=>row.market_value!==null&&Number(row.market_value)>0);if(!priced.length){const text=svgElement('text',{x:180,y:130,'text-anchor':'middle'});text.textContent='No local prices available';chart.append(text);return}const groupTotals=new Map();priced.forEach(row=>groupTotals.set(row.name,(groupTotals.get(row.name)||0)+Number(row.market_value)));const entries=[...groupTotals.entries()].sort((a,b)=>b[1]-a[1]);const circumference=2*Math.PI*76;let offset=0;entries.forEach(([name,value],index)=>{const share=value/total;const color=COLORS[index%COLORS.length];const circle=svgElement('circle',{cx:180,cy:120,r:76,fill:'none',stroke:color,'stroke-width':29,'stroke-dasharray':`${share*circumference} ${circumference-share*circumference}`,'stroke-dashoffset':-offset,transform:'rotate(-90 180 120)'});const title=svgElement('title');title.textContent=`${name}: ${money(value)} (${(share*100).toFixed(1)}%)`;circle.append(title);chart.append(circle);offset+=share*circumference;const line=document.createElement('div');line.className='legend-row';const label=document.createElement('span');label.className='legend-label';const dot=document.createElement('span');dot.className='legend-dot';dot.style.backgroundColor=color;const titleText=document.createElement('span');titleText.className='legend-name';titleText.textContent=name;label.append(dot,titleText);const amount=document.createElement('span');amount.textContent=`${money(value)} · ${(share*100).toFixed(1)}%`;line.append(label,amount);legend.append(line)});const center=svgElement('text',{x:180,y:116,'text-anchor':'middle',style:'font-size:13px'});center.textContent='Priced value';const value=svgElement('text',{x:180,y:139,'text-anchor':'middle',style:'font-size:15px;font-weight:700;fill:#e8edf8'});value.textContent=money(total);chart.append(center,value)}
 function renderBreakdownChart(id,rows){const chart=byId(id);chart.replaceChildren();if(!rows.length){const empty=svgElement('text',{x:220,y:130,'text-anchor':'middle'});empty.textContent='No priced holdings available';chart.append(empty);return}const maximum=Math.max(...rows.map(row=>Number(row.value)));const rowHeight=34,top=16,labelWidth=142,barWidth=190;rows.forEach((row,index)=>{const y=top+index*rowHeight,label=svgElement('text',{x:2,y:y+14,'font-size':10});const labelValue=row.name.length>19?row.name.slice(0,18)+'…':row.name;label.textContent=labelValue;const labelTitle=svgElement('title');labelTitle.textContent=row.name;label.append(labelTitle);chart.append(label);const background=svgElement('rect',{x:labelWidth,y:y,width:barWidth,height:17,rx:5,fill:'#202b40'});chart.append(background);const width=Math.max(2,barWidth*Number(row.value)/maximum);const bar=svgElement('rect',{x:labelWidth,y:y,width,height:17,rx:5,fill:COLORS[index%COLORS.length]});const title=svgElement('title');title.textContent=`${row.name}: ${money(row.value)} · ${Number(row.share).toFixed(1)}%`;bar.append(title);chart.append(bar);const share=svgElement('text',{x:labelWidth+barWidth+8,y:y+13,'font-size':10});share.textContent=`${Number(row.share).toFixed(1)}%`;chart.append(share)})}
+function updateAllocationTargetPreview(){const inputs=[...document.querySelectorAll('#allocation-target-rows input')],button=byId('save-allocation-targets');if(!inputs.length){byId('allocation-target-total').textContent='Targets not set';button.disabled=true;return}const entered=inputs.filter(input=>input.value.trim()!==''),total=entered.reduce((sum,input)=>sum+Number(input.value),0),complete=entered.length===inputs.length,valid=complete&&Math.abs(total-100)<0.000001;byId('allocation-target-total').textContent=`Entered: ${total.toFixed(2)}%${complete?'':' · complete each row'}`;button.disabled=!valid;document.querySelectorAll('#allocation-target-rows tr[data-actual-percent]').forEach(row=>{const input=row.querySelector('input'),driftCell=row.querySelector('.target-drift');if(!input.value.trim()){driftCell.textContent='—';return}const drift=Number(row.dataset.actualPercent)-Number(input.value);driftCell.textContent=`${drift>=0?'+':''}${drift.toFixed(2)} pp`;driftCell.className='num target-drift '+(Math.abs(drift)<0.005?'positive':'negative')})}
+function renderAllocationTargets(data){if(allocationTargetsDirty)return;const body=byId('allocation-target-rows');body.replaceChildren();const rows=data.items||[];if(!rows.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=4;cell.textContent='Sync holdings to configure asset-type targets.';row.append(cell);body.append(row);byId('allocation-target-note').textContent='Targets are saved separately for this account.';updateAllocationTargetPreview();return}rows.forEach(item=>{const row=document.createElement('tr');row.dataset.actualPercent=item.actual_percent;const type=document.createElement('td');type.textContent=item.asset_type;row.append(type);const actual=document.createElement('td');actual.className='num';actual.textContent=`${Number(item.actual_percent).toFixed(2)}%`;row.append(actual);const targetCell=document.createElement('td');targetCell.className='num';const input=document.createElement('input');input.type='number';input.min='0';input.max='100';input.step='0.01';input.inputMode='decimal';input.setAttribute('aria-label',`Target percentage for ${item.asset_type}`);input.value=item.target_percent===null?'':Number(item.target_percent).toString();input.addEventListener('input',()=>{allocationTargetsDirty=true;updateAllocationTargetPreview()});targetCell.append(input);row.append(targetCell);const drift=document.createElement('td');drift.className='num target-drift';drift.textContent=item.drift_percentage_points===null?'—':`${Number(item.drift_percentage_points)>=0?'+':''}${Number(item.drift_percentage_points).toFixed(2)} pp`;row.append(drift);body.append(row)});byId('allocation-target-note').textContent=data.configured?`Saved target mix. ${number(data.unpriced_holdings)} unpriced holding(s) are excluded from actual allocation.`:'Enter your preferred target percentages; all rows must total exactly 100%.';updateAllocationTargetPreview()}
+async function saveAllocationTargets(){const button=byId('save-allocation-targets'),note=byId('allocation-target-note'),inputs=[...document.querySelectorAll('#allocation-target-rows input')],targets=inputs.map(input=>({asset_type:input.closest('tr').cells[0].textContent,target_percent:input.value.trim()}));if(!inputs.length||inputs.some(input=>input.value.trim()==='')){note.textContent='Enter a target for every listed asset type.';note.className='subtle error';return}const total=targets.reduce((sum,target)=>sum+Number(target.target_percent),0);if(Math.abs(total-100)>=0.000001){note.textContent='Target percentages must total exactly 100%.';note.className='subtle error';return}button.disabled=true;note.textContent='Saving allocation targets…';note.className='subtle loading';try{await responseData(await apiFetch('/testing/dashboard/allocation-targets',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({targets})}));allocationTargetsDirty=false;note.className='subtle';await load()}catch(error){note.textContent=error.message;note.className='subtle error'}finally{updateAllocationTargetPreview()}}
 function renderAllocationChange(history){const container=byId('allocation-change');container.replaceChildren();if(historyMode!=='daily'||history.length<2){const note=document.createElement('p');note.className='subtle';note.textContent=historyMode==='daily'?'Allocation change appears after at least two daily valuations.':'Daily allocation history is available in staging.';container.append(note);return}const previous=new Map((history[0].allocations||[]).map(row=>[row.asset_type,Number(row.share)]));const current=new Map((history[history.length-1].allocations||[]).map(row=>[row.asset_type,Number(row.share)]));const types=[...new Set([...previous.keys(),...current.keys()])].sort();types.forEach(type=>{const start=previous.get(type)||0,end=current.get(type)||0,delta=end-start;container.append(statusLine(type,`${start.toFixed(1)}% → ${end.toFixed(1)}% (${delta>=0?'+':''}${delta.toFixed(1)} pp)`,delta>=0?'ok':'warn'))})}
 function renderHistory(history,comparison,mode){const chart=byId('history-chart');chart.replaceChildren();renderAllocationChange(history);if(!history.length){byId('history-note').textContent='No daily valuations in this range yet.';byId('portfolio-change').textContent='No snapshots';byId('portfolio-change').className='pill warn';return}const width=720,height=260,left=58,right=18,top=20,bottom=45,values=history.map(row=>Number(row.market_value)),min=Math.min(...values),max=Math.max(...values),range=max-min||Math.max(max*.05,1),points=history.map((row,index)=>({x:history.length===1?(left+width-right)/2:left+index*(width-left-right)/(history.length-1),y:top+(max-values[index])*(height-top-bottom)/range,row}));chart.append(svgElement('line',{x1:left,y1:height-bottom,x2:width-right,y2:height-bottom,stroke:'#34425d'}));const path=svgElement('polyline',{points:points.map(point=>`${point.x},${point.y}`).join(' '),fill:'none',stroke:'#68d9bd','stroke-width':3,'stroke-linejoin':'round','stroke-linecap':'round'});chart.append(path);points.forEach(point=>{const circle=svgElement('circle',{cx:point.x,cy:point.y,r:5,fill:'#68d9bd'});const title=svgElement('title');title.textContent=`${new Date(point.row.observed_at).toLocaleDateString('en-IN')}: ${money(point.row.market_value)} · ${number(point.row.valued_count)} priced`;circle.append(title);chart.append(circle)});const first=history[0],last=history[history.length-1];if(history.length>1&&mode==='daily'){const delta=Number(last.market_value)-Number(first.market_value),pct=Number(first.market_value)?delta/Number(first.market_value)*100:null;byId('portfolio-change').textContent=`Value change: ${delta>=0?'+':''}${money(delta)}${pct===null?'':` (${pct>=0?'+':''}${pct.toFixed(2)}%)`}`;byId('portfolio-change').className='pill '+(delta>=0?'ok':'warn');byId('history-note').textContent=`${new Date(first.observed_at).toLocaleDateString('en-IN')} → ${new Date(last.observed_at).toLocaleDateString('en-IN')} · ${history.length} daily valuations. Values may have different price coverage; this is value change, not investment return.`}else if(history.length>1){if(comparison&&comparison.amount!==null&&comparison.count>0){const delta=Number(comparison.amount),pct=comparison.percentage===null?null:Number(comparison.percentage);byId('portfolio-change').textContent=`Comparable change: ${delta>=0?'+':''}${money(delta)}${pct===null?'':` (${pct>=0?'+':''}${pct.toFixed(2)}%)`} · ${number(comparison.count)} holdings`;byId('portfolio-change').className='pill '+(delta>=0?'ok':'warn')}else{byId('portfolio-change').textContent='No comparable priced holdings';byId('portfolio-change').className='pill warn'}byId('history-note').textContent=`${new Date(first.observed_at).toLocaleDateString('en-IN')} → ${new Date(last.observed_at).toLocaleDateString('en-IN')} · ${history.length} holdings-sync snapshots. Not investment return.`}else{byId('portfolio-change').textContent='1 snapshot';byId('portfolio-change').className='pill warn';byId('history-note').textContent=mode==='daily'?'Additional daily points appear after each scheduled refresh.':'Sync holdings again to build a holdings-history trend.'}const leftLabel=svgElement('text',{x:left,y:height-12});leftLabel.textContent=new Date(first.observed_at).toLocaleDateString('en-IN');chart.append(leftLabel);const rightLabel=svgElement('text',{x:width-right,y:height-12,'text-anchor':'end'});rightLabel.textContent=new Date(last.observed_at).toLocaleDateString('en-IN');chart.append(rightLabel)}
 function renderSelectedHistory(){const today=new Date(),cutoff=new Date(today.getFullYear(),today.getMonth(),today.getDate()-historyRangeDays+1),cutoffKey=`${cutoff.getFullYear()}-${String(cutoff.getMonth()+1).padStart(2,'0')}-${String(cutoff.getDate()).padStart(2,'0')}`;const selected=historyRows.filter(row=>(row.valuation_date||row.observed_at.slice(0,10))>=cutoffKey);renderHistory(selected,historyComparison,historyMode)}
@@ -843,7 +1032,7 @@ async function load(){if(!accessToken){authSignedOut();return}const requestEpoch
   document.querySelector('#kpis .card:nth-child(3) .label').textContent='Priced market value';
   const kpiValues=[number(d.holdings_rows),number(d.trade_rows),money(d.holdings_market_value),`${number(d.quantity_matching_groups||0)} / ${number(d.matched_security_groups||0)}`];
   [...byId('kpis').children].forEach((card,i)=>{card.querySelector('.value').textContent=kpiValues[i]});
-  const coverage=Number(d.valuation_coverage||0);byId('valuation-coverage').textContent=`${number(d.valued_count)} / ${number(d.holdings_rows)} priced`;byId('valuation-note').textContent=`${number(d.unpriced_count)} holding(s) are excluded from the current estimated total. Price date: ${d.valuation_as_of||'—'}.`;byId('valuation-as-of').textContent=`As of ${d.valuation_as_of||'—'} · ${Math.round(coverage*100)}% coverage`;renderAllocation(d.valued_holdings||[],Number(d.holdings_market_value||0));historyRows=d.snapshot_history||[];historyMode=d.history_mode||'sync';historyComparison=d.comparable_change;const freshness=d.snapshot_freshness;byId('history-freshness').textContent=freshness?`Valuation ${freshness.valuation_date} · holdings last synced ${new Date(freshness.holdings_observed_at).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} · market data through ${freshness.market_data_as_of||'not available'}.`:(historyMode==='daily'?'Daily valuations are saved after the scheduled market-data refresh.':'');renderSelectedHistory();renderBreakdownChart('asset-type-chart',d.asset_type_allocation||[]);renderBreakdownChart('top-holdings-chart',d.top_holdings||[]);renderSuggestions(d.suggestions||[]);renderHoldingTable(d.valued_holdings||[]);
+  const coverage=Number(d.valuation_coverage||0);byId('valuation-coverage').textContent=`${number(d.valued_count)} / ${number(d.holdings_rows)} priced`;byId('valuation-note').textContent=`${number(d.unpriced_count)} holding(s) are excluded from the current estimated total. Price date: ${d.valuation_as_of||'—'}.`;byId('valuation-as-of').textContent=`As of ${d.valuation_as_of||'—'} · ${Math.round(coverage*100)}% coverage`;renderAllocation(d.valued_holdings||[],Number(d.holdings_market_value||0));renderAllocationTargets(d.allocation_targets||{items:[]});historyRows=d.snapshot_history||[];historyMode=d.history_mode||'sync';historyComparison=d.comparable_change;const freshness=d.snapshot_freshness;byId('history-freshness').textContent=freshness?`Valuation ${freshness.valuation_date} · holdings last synced ${new Date(freshness.holdings_observed_at).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} · market data through ${freshness.market_data_as_of||'not available'}.`:(historyMode==='daily'?'Daily valuations are saved after the scheduled market-data refresh.':'');renderSelectedHistory();renderBreakdownChart('asset-type-chart',d.asset_type_allocation||[]);renderBreakdownChart('top-holdings-chart',d.top_holdings||[]);renderSuggestions(d.suggestions||[]);renderHoldingTable(d.valued_holdings||[]);
   const health=byId('health');health.replaceChildren();
   health.append(statusLine('Dhan demat account',d.account_exists?'Connected':'Not found',d.account_exists?'ok':'bad'));
   health.append(statusLine('Holdings snapshot',`${number(d.holdings_rows)} rows · ${d.observed_at?new Date(d.observed_at).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}):'No timestamp'}`,d.holdings_rows?'ok':'warn'));
@@ -861,7 +1050,7 @@ async function load(){if(!accessToken){authSignedOut();return}const requestEpoch
   byId('updated').textContent=`Live ${data.database==='BFAMS-DeFI'?'staging':'TEST'} data · refreshed `+new Date().toLocaleTimeString('en-IN');byId('updated').className='foot';byId('dashboard-data').hidden=false;
  }catch(error){if(requestEpoch!==authEpoch)return;byId('updated').textContent=error.message;byId('updated').className='foot error'}}
 async function syncDhan(){const button=byId('sync-dhan'),status=byId('sync-status');button.disabled=true;status.textContent='Fetching dry-run counts…';status.className='foot loading';const headers={'Accept':'application/json','X-BFAMS-Sync':'1'};try{const previewResponse=await apiFetch('/portfolio/dhan/sync?dry_run=true',{method:'POST',headers});const preview=await previewResponse.json();if(!previewResponse.ok)throw new Error(preview.detail||'Dhan dry run failed.');const countText=`Fetched: ${number(preview.fetched)}\nTo insert: ${number(preview.to_insert)}\nSkipped zero quantity: ${number(preview.skipped_zero_qty)}\nSame quantity: ${number(preview.same_quantity)}\nDifferent quantity: ${number(preview.different_quantity)}\nNew in API: ${number(preview.new_in_api)}\nAbsent from API: ${number(preview.absent_from_api)}\nInferred from symbol only: ${number(preview.inferred_from_symbol_only)}\nWithout ISIN: ${number(preview.without_isin)}`;status.textContent=countText;if(!window.confirm(`Dhan dry-run counts (no records written):\n\n${countText}\n\nProceed with saving the holdings snapshot?`)){status.className='foot';return}status.textContent='Saving holdings snapshot…';const applyResponse=await apiFetch('/portfolio/dhan/sync?dry_run=false',{method:'POST',headers});const result=await applyResponse.json();if(!applyResponse.ok)throw new Error(result.detail||'Dhan holdings sync failed.');status.textContent=`Completed. ${countText}`;status.className='foot';await load()}catch(error){status.textContent=error.message;status.className='foot error'}finally{button.disabled=button.dataset.accountAvailable!=='true'}}
-byId('refresh').addEventListener('click',load);byId('sync-dhan').addEventListener('click',syncDhan);byId('live-valuation').addEventListener('click',fetchLiveValuation);load();window.setInterval(load,60000);
+byId('refresh').addEventListener('click',load);byId('sync-dhan').addEventListener('click',syncDhan);byId('live-valuation').addEventListener('click',fetchLiveValuation);byId('save-allocation-targets').addEventListener('click',saveAllocationTargets);load();window.setInterval(load,60000);
 </script>
 </body>
 </html>"""

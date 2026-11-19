@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.auth import routes as auth_routes
 from app.auth.authorization import get_owned_account, get_owned_connection
 from app.auth.deps import get_auth_db, get_current_user
+from app.auth.schemas import UserResponse
 from app.auth.tokens import create_access_token
 from app.dependencies import get_mf_db
 from app.models import (
@@ -21,6 +22,7 @@ from app.models import (
     FinancialAccount,
     FinancialConnection,
     InvestmentHolding,
+    PortfolioAllocationTarget,
     Transaction,
     User,
     UserCredential,
@@ -96,6 +98,7 @@ class AuthorizationTests(unittest.TestCase):
                 "consent_records",
                 "transactions",
                 "investment_holdings",
+                "portfolio_allocation_targets",
             )
         }
 
@@ -361,6 +364,82 @@ class AuthorizationTests(unittest.TestCase):
         self.assertNotIn("ACCOUNT-B", response.text)
         self.assertNotIn("Private B", response.text)
         self.assertNotIn(str(self.user_b.id), response.text)
+
+    def test_allocation_targets_require_full_mix_and_are_user_scoped(self):
+        self.account_a.external_account_id = "DHAN-DEMAT-1"
+        self.db.add(
+            InvestmentHolding(
+                account_id=self.account_a.id,
+                asset_name="Private ETF",
+                asset_type="ETF",
+                quantity=1,
+                unit_price=125,
+                market_value=125,
+                currency="INR",
+                observed_at=self.holding_a.observed_at,
+            )
+        )
+        self.db.flush()
+
+        self.app.dependency_overrides[testing_dashboard.get_current_user] = (
+            lambda: UserResponse(
+                user_id=self.user_a.id,
+                email="allocation@example.test",
+            )
+        )
+        try:
+            invalid = self.client.put(
+                "/testing/dashboard/allocation-targets",
+                json={
+                    "targets": [
+                        {"asset_type": "EQUITY", "target_percent": "50"},
+                        {"asset_type": "ETF", "target_percent": "49.99"},
+                    ]
+                },
+            )
+            self.assertEqual(invalid.status_code, 422)
+            self.assertEqual(
+                len(self.db.scalars(select(PortfolioAllocationTarget)).all()),
+                0,
+            )
+
+            saved = self.client.put(
+                "/testing/dashboard/allocation-targets",
+                json={
+                    "targets": [
+                        {"asset_type": "EQUITY", "target_percent": "50"},
+                        {"asset_type": "ETF", "target_percent": "50"},
+                    ]
+                },
+            )
+        finally:
+            self.app.dependency_overrides.pop(
+                testing_dashboard.get_current_user,
+                None,
+            )
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()["saved"], 2)
+        self.assertEqual(saved.json()["target_total_percent"], "100")
+        self.db.expire_all()
+        self.assertEqual(
+            len(self.db.scalars(select(PortfolioAllocationTarget)).all()),
+            2,
+        )
+
+        foreign = self.client.put(
+            "/testing/dashboard/allocation-targets",
+            headers=self._headers(self.token_b),
+            json={
+                "targets": [
+                    {"asset_type": "EQUITY", "target_percent": "100"},
+                ]
+            },
+        )
+        self.assertEqual(foreign.status_code, 404)
+        self.assertEqual(
+            len(self.db.scalars(select(PortfolioAllocationTarget)).all()),
+            2,
+        )
 
     def test_nonowned_setu_sync_is_404_before_external_call(self):
         with patch.object(setu_routes, "SetuClient") as client:

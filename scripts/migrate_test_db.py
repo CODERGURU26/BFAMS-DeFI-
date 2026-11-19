@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import text, inspect
 from database import get_test_engine
-from app.models import Base, SecurityDailyPrice
+from app.models import Base, PortfolioAllocationTarget, SecurityDailyPrice
 
 
 def migrate_test_db():
@@ -42,16 +42,30 @@ def migrate_test_db():
 
         conn.commit()
 
-    # 4. Create security_daily_prices table if not exists
-    Base.metadata.create_all(engine, tables=[SecurityDailyPrice.__table__])
+    # 4. Create the missing data tables if they do not exist
+    Base.metadata.create_all(
+        engine,
+        tables=[
+            SecurityDailyPrice.__table__,
+            PortfolioAllocationTarget.__table__,
+        ],
+    )
     print("Table security_daily_prices ensured.")
+    print("Table portfolio_allocation_targets ensured.")
 
     # Verify
     inspector = inspect(engine)
     cols = [c["name"] for c in inspector.get_columns("investment_holdings")]
     has_sdp = "security_daily_prices" in inspector.get_table_names()
+    has_allocation_targets = (
+        "portfolio_allocation_targets" in inspector.get_table_names()
+    )
     print(f"Verification: investment_holdings cols: {cols}")
     print(f"Verification: security_daily_prices exists: {has_sdp}")
+    print(
+        "Verification: portfolio_allocation_targets exists: "
+        f"{has_allocation_targets}"
+    )
 
 
 if __name__ == "__main__":

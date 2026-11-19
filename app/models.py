@@ -362,6 +362,39 @@ class PortfolioValuationSnapshotItem(Base):
     )
 
 
+class PortfolioAllocationTarget(Base):
+    __tablename__ = "portfolio_allocation_targets"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "asset_type",
+            name="uq_portfolio_allocation_targets_account_type",
+        ),
+        CheckConstraint(
+            "target_percent >= 0 AND target_percent <= 100",
+            name="ck_portfolio_allocation_targets_percent",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("financial_accounts.id")
+    )
+    asset_type: Mapped[str] = mapped_column(Text)
+    target_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class SecurityDailyPrice(Base):
     __tablename__ = "security_daily_prices"
 

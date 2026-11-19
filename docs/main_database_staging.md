@@ -65,3 +65,8 @@ holdings without calling Dhan. It records missing/stale-price counts and logs
 under `data_private\logs`. The existing scheduled refresh task remains TEST-only.
 The staging process serves the portfolio view at `http://127.0.0.1:8003/dashboard`;
 the TEST diagnostic page remains at `/testing/dashboard`.
+
+The dashboard also supports account-specific target allocation percentages.
+Settings are stored in `portfolio_allocation_targets`, isolated by database and
+account. Set targets for each listed asset type to exactly 100% in total;
+actual allocation uses priced holdings, with unpriced rows excluded.

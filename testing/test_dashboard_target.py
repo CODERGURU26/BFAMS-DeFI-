@@ -23,3 +23,6 @@ def test_product_dashboard_uses_product_data_route():
     html = response.body.decode("utf-8")
     assert "/dashboard/data" in html
     assert "/testing/dashboard/data" not in html
+    assert "/dashboard/allocation-targets" in html
+    assert "/testing/dashboard/allocation-targets" not in html
+    assert "Target allocation" in html
