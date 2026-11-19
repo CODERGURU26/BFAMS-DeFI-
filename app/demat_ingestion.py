@@ -826,12 +826,13 @@ ISIN_TO_NSE_SYMBOL: Dict[str, Tuple[str, str]] = {
     "INF247L01AP3": ("MOM100", "ETF"),
     "INF247L01AU3": ("MOM50", "ETF"),
     "INF277KA1976": ("TATAGOLD", "ETF"),
-    "INF277KA1984": ("TATASILV", "ETF"),
+    "INF277KA1984": ("TATSILV", "ETF"),
     # REITs (INE prefix, listed but often not in equity bhavcopy)
     "INE041025011": ("EMBASSY", "REIT"),
     "INE0CCU25019": ("MINDSPACE", "REIT"),
     "INE0FDU25010": ("BIRET", "REIT"),
     # Equities (INE prefix)
+    "INE0ZCQ01019": ("BLSPOLY", "EQUITY"),
     "INE0PTN01011": ("MONEYVIEW", "EQUITY"),
     "INE509F01029": ("CUPID", "EQUITY"),
     "INE758T01015": ("ETERNAL", "EQUITY"),

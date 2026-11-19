@@ -210,9 +210,15 @@ class TestIsinResolutionTable(unittest.TestCase):
         self.assertIn("INF204KB14I2", ISIN_TO_NSE_SYMBOL)
         self.assertEqual(ISIN_TO_NSE_SYMBOL["INF204KB14I2"], ("NIFTYBEES", "ETF"))
 
+    def test_tata_silver_etf_uses_nse_symbol(self):
+        self.assertEqual(ISIN_TO_NSE_SYMBOL["INF277KA1984"], ("TATSILV", "ETF"))
+
     def test_known_equity_isins_resolve(self):
         self.assertIn("INE509F01029", ISIN_TO_NSE_SYMBOL)
         self.assertEqual(ISIN_TO_NSE_SYMBOL["INE509F01029"][1], "EQUITY")
+
+    def test_blspoly_isin_resolves(self):
+        self.assertEqual(ISIN_TO_NSE_SYMBOL["INE0ZCQ01019"], ("BLSPOLY", "EQUITY"))
 
     def test_reit_isins_present(self):
         # REITs: Embassy, Mindspace, Brookfield
