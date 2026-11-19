@@ -1,9 +1,12 @@
 """Environment-only settings for the Dhan integration."""
 
 import os
+from dotenv import load_dotenv
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+load_dotenv()
 
 
 class DhanSettings(BaseSettings):
