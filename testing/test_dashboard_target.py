@@ -16,6 +16,19 @@ def test_staging_dashboard_uses_staging_labels_and_disables_registration():
     assert '<form id="auth-register" class="auth-form" hidden>' in html
 
 
+def test_staging_dashboard_shows_staging_registration_when_enabled():
+    with (
+        patch.object(testing_dashboard.settings, "app_database_target", "main"),
+        patch.object(testing_dashboard, "registration_enabled", return_value=True),
+    ):
+        response = testing_dashboard.dashboard()
+
+    html = response.body.decode("utf-8")
+    assert '<form id="auth-register" class="auth-form">' in html
+    assert "Create a staging account" in html
+    assert "This creates a staging login only." in html
+
+
 def test_product_dashboard_uses_product_data_route():
     with patch.object(testing_dashboard, "registration_enabled", return_value=True):
         response = testing_dashboard.product_dashboard()

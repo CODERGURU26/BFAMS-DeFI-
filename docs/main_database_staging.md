@@ -37,13 +37,15 @@ Run the app on a separate port with a process-scoped target selection:
 
 ```powershell
 $env:APP_DATABASE_TARGET = "main"
-$env:AUTH_REGISTRATION_ENABLED = "false"
+$env:AUTH_REGISTRATION_ENABLED = "true"
 $env:AUTH_COOKIE_SECURE = "false"
 .\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8003
 ```
 
 The non-secure cookie setting is only for this loopback HTTP instance; use
-secure cookies when serving staging over HTTPS.
+secure cookies when serving staging over HTTPS. Registration is enabled here
+for local staging signup; keep the server bound to `127.0.0.1` and disable
+registration before exposing it beyond this machine.
 
 The TEST process remains the default. To refresh market data and then save a
 daily staging valuation, use:

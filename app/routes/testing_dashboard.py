@@ -698,6 +698,12 @@ def dashboard():
             ("Sign in to load TEST data.", "Sign in to load staging data."),
             ("Live TEST data · refreshed", "Live staging data · refreshed"),
             ("Test dashboard", "Staging dashboard"),
+            ("Create a test account", "Create a staging account"),
+            (
+                "Registration may be disabled by server configuration.",
+                "Use a unique email and a password of at least 12 characters. "
+                "This creates a staging login only.",
+            ),
             ('<a href="/testing/connect">Connect institution</a>', ""),
         )
         for old_text, new_text in replacements:
