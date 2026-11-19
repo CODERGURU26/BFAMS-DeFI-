@@ -3,6 +3,19 @@ from unittest.mock import patch
 from app.routes import testing_dashboard
 
 
+def test_test_dashboard_hides_registration_configuration_note():
+    with (
+        patch.object(testing_dashboard.settings, "app_database_target", "test"),
+        patch.object(testing_dashboard, "registration_enabled", return_value=True),
+    ):
+        response = testing_dashboard.dashboard()
+
+    assert (
+        "Registration may be disabled by server configuration."
+        not in response.body.decode("utf-8")
+    )
+
+
 def test_staging_dashboard_uses_staging_labels_and_disables_registration():
     with (
         patch.object(testing_dashboard.settings, "app_database_target", "main"),
@@ -14,6 +27,7 @@ def test_staging_dashboard_uses_staging_labels_and_disables_registration():
     assert "STAGING DATABASE" in html
     assert "TEST DATABASE" not in html
     assert '<form id="auth-register" class="auth-form" hidden>' in html
+    assert "Registration may be disabled by server configuration." not in html
 
 
 def test_staging_dashboard_shows_staging_registration_when_enabled():
@@ -26,7 +40,7 @@ def test_staging_dashboard_shows_staging_registration_when_enabled():
     html = response.body.decode("utf-8")
     assert '<form id="auth-register" class="auth-form">' in html
     assert "Create a staging account" in html
-    assert "This creates a staging login only." in html
+    assert "Registration may be disabled by server configuration." not in html
 
 
 def test_product_dashboard_uses_product_data_route():

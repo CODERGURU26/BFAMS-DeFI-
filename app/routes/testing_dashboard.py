@@ -699,11 +699,6 @@ def dashboard():
             ("Live TEST data · refreshed", "Live staging data · refreshed"),
             ("Test dashboard", "Staging dashboard"),
             ("Create a test account", "Create a staging account"),
-            (
-                "Registration may be disabled by server configuration.",
-                "Use a unique email and a password of at least 12 characters. "
-                "This creates a staging login only.",
-            ),
             ('<a href="/testing/connect">Connect institution</a>', ""),
         )
         for old_text, new_text in replacements:
@@ -905,7 +900,6 @@ _DASHBOARD_HTML = """<!doctype html>
         <label>Email<input name="email" type="email" autocomplete="email" maxlength="320" required></label>
         <label>Password<span class="auth-password-field"><input name="password" type="password" autocomplete="new-password" minlength="12" maxlength="128" required><button class="button auth-toggle-password" type="button" aria-pressed="false">Show</button></span></label>
         <button class="button" type="submit">Register</button>
-        <span class="subtle">Registration may be disabled by server configuration.</span>
       </form>
     </div>
     <section id="auth-mfa-step" class="auth-only" hidden>
