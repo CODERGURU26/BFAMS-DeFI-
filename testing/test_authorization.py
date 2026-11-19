@@ -412,6 +412,17 @@ class AuthorizationTests(unittest.TestCase):
                     ]
                 },
             )
+            dashboard = self.client.get("/testing/dashboard/data")
+            self.assertEqual(dashboard.status_code, 200, dashboard.text)
+            allocation = dashboard.json()["dhan"]["allocation_targets"]
+            self.assertTrue(allocation["configured"])
+            self.assertEqual(
+                {
+                    item["asset_type"]: item["target_percent"]
+                    for item in allocation["items"]
+                },
+                {"EQUITY": "50.00", "ETF": "50.00"},
+            )
         finally:
             self.app.dependency_overrides.pop(
                 testing_dashboard.get_current_user,

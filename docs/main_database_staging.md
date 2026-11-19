@@ -70,3 +70,5 @@ The dashboard also supports account-specific target allocation percentages.
 Settings are stored in `portfolio_allocation_targets`, isolated by database and
 account. Set targets for each listed asset type to exactly 100% in total;
 actual allocation uses priced holdings, with unpriced rows excluded.
+The staging table is created by `scripts\migrate_main_db.py --apply`; the
+separate TEST table is created by `scripts\migrate_test_db.py`.
