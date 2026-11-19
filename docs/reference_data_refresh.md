@@ -36,3 +36,7 @@ The wrapper writes timestamped logs under `data_private\logs`. Its default is
 existing scheduled task remains TEST-only. Keep the machine awake at the
 scheduled time and configure Task Scheduler to run missed tasks as soon as
 possible.
+
+The staging portfolio task is registered separately with
+`scripts\register_staging_refresh_task.ps1`; it runs market refresh and daily
+valuation capture in sequence at 9:45 PM on weekdays.

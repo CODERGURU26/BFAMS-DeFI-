@@ -45,13 +45,23 @@ $env:AUTH_COOKIE_SECURE = "false"
 The non-secure cookie setting is only for this loopback HTTP instance; use
 secure cookies when serving staging over HTTPS.
 
-The TEST process remains the default. Refresh staging reference data explicitly
-before importing holdings:
+The TEST process remains the default. To refresh market data and then save a
+daily staging valuation, use:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\refresh_reference_data.py --target main
+.\.venv\Scripts\python.exe scripts\create_daily_portfolio_snapshots.py --target main
 ```
 
-The existing scheduled refresh task remains TEST-only.
+Register the separate weekday staging job at 9:45 PM (after the existing TEST
+refresh) with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\register_staging_refresh_task.ps1
+```
+
+The staging job refreshes AMFI/NSE data first, then snapshots the last synced
+holdings without calling Dhan. It records missing/stale-price counts and logs
+under `data_private\logs`. The existing scheduled refresh task remains TEST-only.
 The staging process serves the portfolio view at `http://127.0.0.1:8003/dashboard`;
 the TEST diagnostic page remains at `/testing/dashboard`.

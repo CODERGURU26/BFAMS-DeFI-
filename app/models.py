@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CHAR,
     CheckConstraint,
     Date,
@@ -282,6 +283,82 @@ class InvestmentHolding(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class PortfolioValuationSnapshot(Base):
+    __tablename__ = "portfolio_valuation_snapshots"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "valuation_date",
+            name="uq_portfolio_valuation_snapshots_account_date",
+        ),
+        Index(
+            "idx_portfolio_valuation_snapshots_account_date",
+            "account_id",
+            "valuation_date",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("financial_accounts.id")
+    )
+    valuation_date: Mapped[date] = mapped_column(Date)
+    holdings_observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True)
+    )
+    total_market_value: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    total_holdings: Mapped[int] = mapped_column(Integer)
+    priced_holdings: Mapped[int] = mapped_column(Integer)
+    unpriced_holdings: Mapped[int] = mapped_column(Integer)
+    stale_holdings: Mapped[int] = mapped_column(Integer)
+    market_data_as_of: Mapped[date | None] = mapped_column(Date, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class PortfolioValuationSnapshotItem(Base):
+    __tablename__ = "portfolio_valuation_snapshot_items"
+
+    __table_args__ = (
+        Index(
+            "idx_portfolio_valuation_snapshot_items_type",
+            "snapshot_id",
+            "asset_type",
+        ),
+    )
+
+    snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("portfolio_valuation_snapshots.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    holding_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("investment_holdings.id"),
+        primary_key=True,
+    )
+    asset_name: Mapped[str] = mapped_column(Text)
+    asset_identifier: Mapped[str | None] = mapped_column(Text, nullable=True)
+    asset_type: Mapped[str] = mapped_column(Text)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(20, 6))
+    unit_price: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 4), nullable=True
+    )
+    market_value: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 4), nullable=True
+    )
+    currency: Mapped[str] = mapped_column(
+        CHAR(3), server_default=text("'INR'")
+    )
+    price_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    status: Mapped[str] = mapped_column(Text)
+    is_stale: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false")
     )
 
 
